@@ -1,5 +1,8 @@
 // Pure game logic shared by the player app and the host dashboard.
 
+// The name players see for the host.
+export const HOST_NAME = "Ogouyo";
+
 export const DEFAULT_POINTS = { easy: 10, medium: 20, hard: 30, twistBonus: 10, hostQuestReward: 10, dare: 10, suggestBonus: 5 };
 
 export const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -110,4 +113,35 @@ export function slotMath(quests, playerCount, config) {
     personal: s.length,
     personalNeeded: playerCount * (p.personalQuestsPerPlayer ?? p.personal),
   };
+}
+
+// Sorting and filtering for quest lists (player Board + host Quests tab).
+export const LEVEL_ORDER = { easy: 0, medium: 1, hard: 2 };
+export const DEFAULT_VIEW = { sort: "smart", levels: [], space: false, size: "any" };
+export function activeFilterCount(v) { return (v.levels.length ? 1 : 0) + (v.space ? 1 : 0) + (v.size !== "any" ? 1 : 0); }
+export function filterSort(list, view, uid = null) {
+  const { sort, levels, space, size } = { ...DEFAULT_VIEW, ...view };
+  const out = list.filter((q) => {
+    if (levels.length && !levels.includes(q.level)) return false;
+    if (space && !(uid && q.members.includes(uid)) && (q.status === "done" || q.members.length >= q.max)) return false;
+    if (size !== "any") {
+      if (q.type !== "group") return false;
+      if (size === "4+" ? q.max < 4 : !(q.min <= Number(size) && Number(size) <= q.max)) return false;
+    }
+    return true;
+  });
+  const byOrder = (a, b) => (a.order ?? 0) - (b.order ?? 0);
+  const byTitle = (a, b) => a.title.localeCompare(b.title);
+  // Smart: mine first, then quests closest to starting, then open ones, full/done last.
+  const rank = (q) => {
+    if (uid && q.members.includes(uid)) return -100;
+    if (q.status === "done" || q.members.length >= q.max) return 100;
+    if (q.members.length && q.members.length < q.min) return q.min - q.members.length;
+    return 10;
+  };
+  if (sort === "az") out.sort(byTitle);
+  else if (sort === "level") out.sort((a, b) => (LEVEL_ORDER[a.level] ?? 9) - (LEVEL_ORDER[b.level] ?? 9) || byTitle(a, b));
+  else if (sort === "smart") out.sort((a, b) => rank(a) - rank(b) || byOrder(a, b));
+  else out.sort(byOrder);
+  return out;
 }

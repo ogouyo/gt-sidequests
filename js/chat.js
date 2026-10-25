@@ -1,6 +1,6 @@
 // Shared chat helpers for the player app and host dashboard.
 // Chat ids: "q_<questId>" for a quest's team chat, "d_<uidA>_<uidB>" (sorted) for private messages.
-import { esc } from "./game.js";
+import { esc, HOST_NAME } from "./game.js";
 
 export const questChatId = (questId) => `q_${questId}`;
 export const dmChatId = (a, b) => `d_${[a, b].sort().join("_")}`;
@@ -22,7 +22,7 @@ export function messagesHtml(msgs, me, nameOf) {
     const showName = !mine && m.from !== prev;
     prev = m.from;
     return `<div class="bubble ${mine ? "mine" : ""} ${admin ? "admin" : ""}">
-      ${showName ? `<div class="who">${admin ? "📣 Admin" : esc(nameOf(m.from))}</div>` : ""}
+      ${showName ? `<div class="who">${admin ? `📣 ${HOST_NAME}` : esc(nameOf(m.from))}</div>` : ""}
       <div>${esc(m.text)}</div><div class="t">${time(m.at)}</div></div>`;
   }).join("");
 }

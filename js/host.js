@@ -4,13 +4,14 @@ import {
   query, orderBy, limitToLast,
 } from "./firebase.js";
 import { ms, messagesHtml, keepScroll, GROUP_CHAT } from "./chat.js";
-import { esc, sizeLabel, questState, slotText, myQuests, coreProgress, computeScores, slotMath } from "./game.js";
+import { esc, sizeLabel, questState, slotText, myQuests, coreProgress, computeScores, slotMath, filterSort } from "./game.js";
 
 const { auth, db } = makeApp("host", { offline: false });
 
 const S = {
   user: undefined, config: null, quests: [], players: new Map(), claims: [], inbox: [],
   tab: "overview", qfilter: "group", sheet: null, busy: false, listening: false,
+  hview: { sort: "order", level: "all", space: false, size: "any" }, importMode: "full",
   chats: [], msgs: [], requests: [], dares: [], dareText: {}, shopping: {}, defaulted: false,
 };
 // Default bring-list deadline: Thursday 29 October 2026, 11:59pm Lagos time.
@@ -22,6 +23,12 @@ const nameOf = (uid) => (uid === "admin" ? "Admin" : S.players.get(uid)?.name ||
 const qById = (id) => S.quests.find((q) => q.id === id);
 let tt;
 const toast = (m) => { $toast.innerHTML = `<div class="toast">${esc(m)}</div>`; clearTimeout(tt); tt = setTimeout(() => ($toast.innerHTML = ""), 3000); };
+// Solo quests read better as Available / Taken by X than "0/1 joined".
+function hostSlot(q) {
+  if (q.type !== "personal") return slotText(q);
+  if (q.status === "done") return `Completed by ${q.members.map(nameOf).join(", ") || "?"}`;
+  return q.members.length ? `Taken by ${q.members.map(nameOf).join(", ")}` : "Available";
+}
 const isHost = (u) => u && u.email === HOST_EMAIL;
 const playerLink = () => new URL("./", location.href).href;
 
@@ -175,7 +182,9 @@ function viewOverview() {
     <button class="btn primary" data-act="saveRules">Save house rules</button>
 
     <h2>Data</h2>
-    <div class="row"><button class="btn" data-act="import">Re-import quests.json</button></div>
+    <div class="row"><button class="btn" data-act="importAdd">＋ Add new quests from file</button><button class="btn" data-act="exportQuests">⬇ Download quests.json</button></div>
+    <p class="sub" style="font-size:13px">"Add new quests" only adds quests you don't already have (matched by name), so your edits are safe. "Download" saves your live quests, twists and settings as a backup.</p>
+    <div class="row" style="margin-top:8px"><button class="btn danger" data-act="import">Replace all quest text from file</button></div>
     <div class="row" style="margin-top:8px"><button class="btn danger" data-act="resetProgress">Reset all progress</button><button class="btn danger" data-act="resetAll">Remove all players</button></div>
     <p class="sub" style="font-size:13px">Use the reset buttons after testing, before you share the link.</p>`;
 }
@@ -187,17 +196,27 @@ function viewQuests() {
   if (f === "group") list = list.filter((q) => q.pool === "core" && q.type === "group");
   if (f === "personal") list = list.filter((q) => q.pool === "core" && q.type === "personal");
   if (f === "bonus") list = list.filter((q) => q.pool === "bonus");
+  const hv = S.hview;
+  const size = f === "personal" ? "any" : hv.size;
+  list = filterSort(list, { sort: hv.sort, levels: hv.level === "all" ? [] : [hv.level], space: hv.space, size });
   const options = [...S.players.entries()].sort((a, b) => a[1].name.localeCompare(b[1].name));
+  const sel = (key, opts) => `<select class="field" data-act="hview" data-key="${key}">${opts.map(([v, l]) => `<option value="${v}" ${String(hv[key]) === v ? "selected" : ""}>${l}</option>`).join("")}</select>`;
   return `
     <div class="seg">${seg("group", "Core group")}${seg("personal", "Core solo")}${seg("bonus", "Bonus")}</div>
-    <button class="btn small" data-act="newQuest" style="margin-bottom:12px">＋ New quest</button>
+    <div class="hfilters">
+      <button class="btn small" data-act="newQuest">＋ New quest</button>
+      ${sel("sort", [["order", "Sort: default"], ["az", "Sort: A–Z"], ["level", "Sort: difficulty"], ["smart", "Sort: smart"]])}
+      ${sel("level", [["all", "All levels"], ["easy", "Easy"], ["medium", "Medium"], ["hard", "Hard"]])}
+      ${f !== "personal" ? sel("size", [["any", "Any size"], ["2", "Fits 2"], ["3", "Fits 3"], ["4+", "4+ players"]]) : ""}
+      <label class="check"><input type="checkbox" data-act="hview" data-key="space" ${hv.space ? "checked" : ""}> Has space only</label>
+    </div>
     ${list.map((q) => {
       const st = questState(q);
       const addable = options.filter(([u]) => !q.members.includes(u));
       return `<div class="card ${q.active ? "" : "done"}">
         <div class="hrow" style="padding:0">
           <label class="switch" title="Active"><input type="checkbox" data-act="active" data-id="${q.id}" ${q.active ? "checked" : ""}><span></span></label>
-          <div class="grow"><b>${esc(q.title)}</b><small>${q.level} · ${q.type === "personal" ? "solo" : sizeLabel(q) + " players"} · <span class="state ${st}">${esc(slotText(q))}</span>${q.needsHostSetup ? " · ⚠️ needs setup" : ""}</small></div>
+          <div class="grow"><b>${esc(q.title)}</b><small>${q.level} · ${q.type === "personal" ? "solo" : sizeLabel(q) + " players"} · <span class="state ${st}">${esc(hostSlot(q))}</span>${q.needsHostSetup ? " · ⚠️ needs setup" : ""}</small></div>
           <button class="btn small" data-act="edit" data-id="${q.id}">Edit</button>
           <button class="btn small ${st === "done" ? "" : "primary"}" data-act="${st === "done" ? "reopen" : "markDone"}" data-id="${q.id}" ${q.members.length ? "" : "disabled"}>${st === "done" ? "Reopen" : "Done"}</button>
         </div>
@@ -233,7 +252,7 @@ function viewInbox() {
   const extra = `
     <h2>Player-made quests (${made.length})</h2>
     ${made.length ? `<div class="list">${made.map((q) => `<div class="hrow"><div class="grow"><b>${esc(q.title)}</b>
-      <small>by ${esc(nameOf(q.suggestedBy))} · ${q.type === "personal" ? "solo" : q.max + " players"} · ${esc(slotText(q))}</small>${q.blurb ? `<small>${esc(q.blurb)}</small>` : ""}</div>
+      <small>by ${esc(nameOf(q.suggestedBy))} · ${q.type === "personal" ? "solo" : q.max + " players"} · ${esc(hostSlot(q))}</small>${q.blurb ? `<small>${esc(q.blurb)}</small>` : ""}</div>
       <button class="btn small" data-act="edit" data-id="${q.id}">Edit</button><button class="btn small danger" data-act="delSuggested" data-id="${q.id}">Remove</button></div>`).join("")}</div>`
       : `<div class="empty-state">None yet.</div>`}
     <h2>Dares between players (${S.dares.length})</h2>
@@ -410,6 +429,7 @@ function writeSlots(b, id, twists, oldCount) {
 async function importFile(file) {
   const data = JSON.parse(await file.text());
   if (!Array.isArray(data.quests)) throw new Error("That file has no quests list.");
+  if (S.importMode === "add" && S.quests.length) return importAdd(data);
   if (S.quests.length && !confirm("Re-importing overwrites quest text and twists (including your edits). Who joined what is kept. Continue?")) return;
   const b = writeBatch(db);
   b.set(doc(db, "config", "game"), {
@@ -430,6 +450,46 @@ async function importFile(file) {
   });
   await b.commit();
   toast(`Imported ${data.quests.length} quests`);
+}
+
+// Add only quests that don't exist yet (same id or same title), leaving everything else untouched.
+async function importAdd(data) {
+  const titles = new Set(S.quests.map((q) => q.title.trim().toLowerCase()));
+  const fresh = data.quests.filter((q) => !qById(q.id) && !titles.has(q.title.trim().toLowerCase()));
+  if (!fresh.length) return toast("Nothing new in that file. You already have all its quests.");
+  if (!confirm(`Add ${fresh.length} new quest${fresh.length > 1 ? "s" : ""}?\n\n${fresh.map((q) => "• " + q.title).join("\n")}`)) return;
+  let order = Math.max(0, ...S.quests.filter((q) => !q.suggestedBy).map((q) => q.order ?? 0)) + 1;
+  const b = writeBatch(db);
+  for (const q of fresh) {
+    const twists = q.twists || [];
+    b.set(doc(db, "quests", q.id), {
+      ...blankState(), active: true, order: order++,
+      title: q.title, blurb: q.blurb || "", type: q.type, pool: q.pool, level: q.level, category: q.category || "",
+      min: q.min, max: q.max, instructions: q.instructions || [], doneWhen: q.doneWhen || "",
+      twistCount: twists.length, needsHostSetup: twists.some((t) => t.includes("[HOST")),
+    });
+    writeSlots(b, q.id, twists, 0);
+  }
+  await b.commit();
+  toast(`Added ${fresh.length} quests`);
+}
+
+async function exportQuests() {
+  const quests = [];
+  for (const q of S.quests.filter((x) => !x.suggestedBy)) {
+    const snaps = await Promise.all(Array.from({ length: q.twistCount || 0 }, (_, i) => getDoc(doc(db, "questSecrets", q.id, "slots", String(i)))));
+    quests.push({
+      id: q.id, title: q.title, type: q.type, pool: q.pool, min: q.min, max: q.max, level: q.level, category: q.category || "",
+      blurb: q.blurb || "", instructions: q.instructions || [], doneWhen: q.doneWhen || "",
+      twists: snaps.map((s) => (s.exists() ? s.data().text : "")),
+    });
+  }
+  const data = { version: 2, points: S.config?.points || {}, picking: S.config?.picking || {}, houseRules: S.config?.houseRules || [], quests };
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: "application/json" }));
+  a.download = "quests.json";
+  a.click();
+  toast(`Downloaded ${quests.length} quests`);
 }
 
 async function approve(claimId) {
@@ -516,7 +576,9 @@ document.addEventListener("click", (e) => {
     tab: () => { S.tab = id; render(); },
     qfilter: () => { S.qfilter = id; render(); },
     copy: () => navigator.clipboard.writeText(playerLink()).then(() => toast("Link copied")),
-    import: () => document.getElementById("importFile").click(),
+    import: () => { S.importMode = "full"; document.getElementById("importFile").click(); },
+    importAdd: () => { S.importMode = "add"; document.getElementById("importFile").click(); },
+    exportQuests: () => run(exportQuests),
     edit: () => run(() => openEdit(id)),
     newQuest: () => { S.sheet = { isNew: true, twists: [], q: { title: "", blurb: "", type: "group", pool: "bonus", level: "easy", category: "", min: 2, max: 2, instructions: [], doneWhen: "" } }; renderOverlay(); },
     close: () => { if (msgUnsub) { msgUnsub(); msgUnsub = null; } S.sheet = null; renderOverlay(); },
@@ -578,6 +640,7 @@ document.addEventListener("change", (e) => {
   if (t.id === "importFile" && t.files[0]) { run(() => importFile(t.files[0])); t.value = ""; return; }
   const { act, id, key } = t.dataset;
   if (act === "shopTick") run(() => setDoc(doc(db, "config", "shopping"), { checked: { [t.dataset.key]: t.checked } }, { merge: true }));
+  if (act === "hview") { S.hview[key] = t.type === "checkbox" ? t.checked : t.value; render(); return; }
   if (act === "active") run(() => updateDoc(doc(db, "quests", id), { active: t.checked }));
   if (act === "cfg" && key === "pickingOpen") run(() => setDoc(doc(db, "config", "game"), { pickingOpen: t.checked }, { merge: true }));
   if (act === "cfg" && key === "noRepeatTeammates") run(() => setDoc(doc(db, "config", "game"), { picking: { noRepeatTeammates: t.checked } }, { merge: true }));

@@ -7,6 +7,7 @@ import {
 import { questChatId, dmChatId, ms, messagesHtml, keepScroll, GROUP_CHAT } from "./chat.js";
 import {
   esc, sizeLabel, questState, slotText, myQuests, coreProgress, canJoin, canLeave, computeScores,
+  HOST_NAME, filterSort, activeFilterCount, DEFAULT_VIEW,
 } from "./game.js";
 
 const { auth, db } = makeApp("player");
@@ -15,6 +16,7 @@ const S = {
   uid: null, me: undefined, claim: undefined, config: null,
   quests: [], players: new Map(),
   tab: "mine", board: "group",
+  view: { ...DEFAULT_VIEW }, viewOpen: false,
   sheet: null,          // { kind: 'quest', id } | { kind: 'inbox' }
   secrets: {},          // questId -> { key, text }
   revealed: new Set(),
@@ -43,7 +45,7 @@ const $overlay = document.getElementById("overlay");
 const $toast = document.getElementById("toast");
 
 /* ---------- helpers ---------- */
-const nameOf = (uid) => (uid === "admin" ? "Admin" : S.players.get(uid)?.name || "Someone");
+const nameOf = (uid) => (uid === "admin" ? HOST_NAME : S.players.get(uid)?.name || "Someone");
 const fmtTime = (t) => new Date(ms(t)).toLocaleString([], { weekday: "short", day: "numeric", month: "short", hour: "numeric", minute: "2-digit" });
 const requestsOpen = () => !!S.config?.requestDeadline && Date.now() < ms(S.config.requestDeadline);
 const qById = (id) => S.quests.find((q) => q.id === id);
@@ -55,13 +57,16 @@ function toast(msg) {
 }
 function friendly(e) {
   const m = String(e?.code || e?.message || e);
+  const code = e?.code ? ` (${String(e.code).replace(/^(auth|firestore)\//, "")})` : "";
+  if (/provider-already-linked|credential-already-in-use|email-already-in-use/.test(m)) return "This phone is half signed in. Tap Start over below, then try again." + code;
+  if (m.includes("resource-exhausted") || m.includes("quota")) return `The game hit its free daily limit. Tell ${HOST_NAME}.` + code;
   if (/invalid-credential|wrong-password|user-not-found|invalid-login/.test(m)) return "Wrong PIN for that name.";
   if (m.includes("too-many-requests")) return "Too many tries. Wait a few minutes and try again.";
-  if (m.includes("operation-not-allowed")) return "PIN sign-in isn't switched on yet. Tell Shalom.";
+  if (m.includes("operation-not-allowed")) return `PIN sign-in isn't switched on yet. Tell ${HOST_NAME}.`;
   if (m.includes("network-request-failed")) return "No signal right now. Try again in a moment.";
   if (m.includes("unavailable") || m.includes("offline")) return "No signal right now. Try again in a moment.";
-  if (m.includes("permission")) return "That move isn't allowed right now.";
-  return e?.message && !e.code ? e.message : "Something went wrong. Try again.";
+  if (m.includes("permission")) return "That move isn't allowed right now." + code;
+  return e?.message && !e.code ? e.message : "Something went wrong. Try again." + code;
 }
 function reason(r) {
   if (r?.startsWith("clash:")) return `You're already teamed with ${nameOf(r.slice(6))} in your other group quest. Mix it up!`;
@@ -69,6 +74,23 @@ function reason(r) {
 }
 
 /* ---------- auth + data ---------- */
+// Make sure there's a signed-in (at least anonymous) session before touching the database.
+let anonPending = null;
+async function ensureSession() {
+  await auth.authStateReady();
+  if (auth.currentUser) return auth.currentUser;
+  if (!anonPending) anonPending = signInAnonymously(auth).finally(() => { anonPending = null; });
+  return (await anonPending).user;
+}
+const TRANSIENT = /aborted|unavailable|deadline-exceeded|internal|network-request-failed|offline/;
+async function withRetry(fn) {
+  try { return await fn(); }
+  catch (e) {
+    if (!TRANSIENT.test(String(e?.code || e?.message))) throw e;
+    await new Promise((r) => setTimeout(r, 900));
+    return fn();
+  }
+}
 let unsubs = [];
 const spinner = `<div class="center"><div class="spinner"></div></div>`;
 onAuthStateChanged(auth, (user) => {
@@ -78,7 +100,7 @@ onAuthStateChanged(auth, (user) => {
     questChatUnsubs.forEach((f) => f()); questChatUnsubs = new Map();
     if (msgUnsub) { msgUnsub(); msgUnsub = null; }
     $root.innerHTML = spinner; $overlay.innerHTML = "";
-    signInAnonymously(auth).catch((e) => {
+    ensureSession().catch((e) => {
       $root.innerHTML = `<div class="wrap center"><div><h1>Can't connect</h1><p class="sub">${esc(friendly(e))}</p></div></div>`;
     });
     return;
@@ -96,7 +118,7 @@ onAuthStateChanged(auth, (user) => {
 
 function listen() {
   const on = (...a) => unsubs.push(onSnapshot(...a));
-  on(doc(db, "players", S.uid), (s) => { S.me = s.exists() ? s.data() : null; render(); });
+  on(doc(db, "players", S.uid), (s) => { S.me = s.exists() ? s.data() : null; render(); }, () => {});
   on(doc(db, "claims", S.uid), (s) => { S.claim = s.exists() ? s.data() : null; render(); }, () => { S.claim = null; render(); });
   on(doc(db, "config", "game"), (s) => { S.config = s.exists() ? s.data() : null; render(); });
   on(collection(db, "players"), (snap) => {
@@ -187,9 +209,9 @@ function viewChats() {
   const dms = [...S.dmChats.entries()].sort((a, b) => ms(b[1].lastAt) - ms(a[1].lastAt));
   return `
     <h1>Chats</h1>
-    <div class="caution">⚠️ Chats can be read by admin. Be warned!</div>
+    <div class="caution">⚠️ Chats can be read by ${HOST_NAME}. Be warned!</div>
     <h2>Group</h2>
-    <div class="list">${row(GROUP_CHAT, S.groupChat, chatTitle(GROUP_CHAT), "Everyone playing, plus admin announcements")}</div>
+    <div class="list">${row(GROUP_CHAT, S.groupChat, chatTitle(GROUP_CHAT), `Everyone playing, plus announcements from ${HOST_NAME}`)}</div>
     <h2>Team chats</h2>
     ${mineQ.length ? `<div class="list">${mineQ.map((q) => row(questChatId(q.id), S.questChats.get(questChatId(q.id)), q.title, "Chat with your team")).join("")}</div>`
       : `<div class="empty-state">Join a group quest to get a team chat.</div>`}
@@ -251,7 +273,7 @@ function renderGate() {
     $root.innerHTML = `<div class="wrap center"><div>
       <div class="spinner" style="margin:0 auto 18px"></div>
       <h1>Hold tight, ${esc(S.claim.name)}</h1>
-      <p class="sub">Shalom needs to confirm it's you on this phone. Ping them, then this screen will update by itself.</p>
+      <p class="sub">${HOST_NAME} needs to confirm it's you on this phone. Ping them, then this screen will update by itself.</p>
       <button class="btn ghost" style="margin-top:20px" data-act="cancelClaim">Cancel</button>
     </div></div>`;
     return;
@@ -261,7 +283,7 @@ function renderGate() {
   const seg = (id, label) => `<button type="button" class="${S.gateMode === id ? "on" : ""}" data-act="gateMode" data-id="${id}">${label}</button>`;
   $root.innerHTML = `<div class="wrap">
     <div class="hero"><h1>GT<span>SIDEQUESTS</span></h1>
-      <p class="sub">Little missions for the night. Pick your quests, team up with people you don't know yet, cause some (friendly) chaos.</p></div>
+      <p class="sub">Fun little sidequests to do at GT Abuja</p></div>
     <div class="seg">${seg("join", "I'm new")}${seg("login", "Log in")}</div>
     ${join ? `<h2>House rules</h2><ul class="rules">${rules.map((r) => `<li>${esc(r)}</li>`).join("")}</ul>
       <h2>Pick a name and a PIN</h2>` : `<h2>Welcome back</h2>`}
@@ -272,7 +294,7 @@ function renderGate() {
       <button class="btn primary" ${S.busy ? "disabled" : ""}>${join ? "I agree, let's go" : "Log in"}</button>
     </form>
     ${join ? `<p class="sub" style="margin-top:12px;font-size:13px">Remember your PIN. You'll need it to log back in.</p>` : ""}
-    ${S.linked ? `<button class="btn ghost small" style="margin-top:12px" data-act="logout">Start over</button>` : ""}
+    ${S.linked || S.regError.includes("Start over") ? `<button class="btn ghost small" style="margin-top:12px" data-act="logout">Start over</button>` : ""}
     <p class="sub" style="margin:18px 0 40px;font-size:13px">Tip: open this link in Chrome or Safari, not inside WhatsApp.</p>
   </div>`;
 }
@@ -312,7 +334,7 @@ function viewMine() {
     const bits = [];
     if (needG > 0) bits.push(`${needG} group quest${needG > 1 ? "s" : ""}`);
     if (needP > 0) bits.push(`${needP} solo quest`);
-    todo = `<div class="note">You still need to pick ${bits.join(" and ")}. ${S.config?.pickingOpen ? "" : "Picking is locked, so message Shalom."}</div>
+    todo = `<div class="note">You still need to pick ${bits.join(" and ")}. ${S.config?.pickingOpen ? "" : `Picking is locked, so message ${HOST_NAME}.`}</div>
       ${S.config?.pickingOpen ? `<button class="btn primary" style="margin-top:12px" data-act="tab" data-id="board">Go to the board</button>` : ""}`;
   }
   return `
@@ -338,14 +360,8 @@ function viewBoard() {
   if (S.board === "group") list = list.filter((q) => q.pool === "core" && q.type === "group");
   if (S.board === "personal") list = list.filter((q) => q.pool === "core" && q.type === "personal");
   if (S.board === "bonus") list = list.filter((q) => q.pool === "bonus");
-  // Mine first, then quests that are closest to starting, then the rest.
-  const rank = (q) => {
-    if (q.members.includes(S.uid)) return -100;
-    if (q.status === "done" || q.members.length >= q.max) return 100;
-    if (q.members.length && q.members.length < q.min) return q.min - q.members.length;
-    return 10;
-  };
-  list.sort((a, b) => rank(a) - rank(b));
+  const v = { ...S.view, size: S.board === "personal" ? "any" : S.view.size };
+  list = filterSort(list, v, S.uid);
   const intro = {
     group: "Pick 2. Names show who's already in. Your two group quests need different teammates.",
     personal: "Pick 1. First come, first served.",
@@ -355,8 +371,30 @@ function viewBoard() {
     <h1>Quest board</h1>
     ${S.config?.pickingOpen ? "" : `<div class="note">Picking is locked. Core quests can't be swapped now.</div>`}
     <div class="seg">${seg("group", "Group")}${seg("personal", "Solo")}${seg("bonus", prog.allDone ? "Bonus" : "Bonus 🔒")}</div>
-    <p class="sub" style="margin-bottom:14px">${intro}</p>
-    ${list.map(questCard).join("") || `<div class="empty-state">Nothing here yet.</div>`}`;
+    <p class="sub" style="margin-bottom:10px">${intro}</p>
+    ${viewControls(v)}
+    ${list.map(questCard).join("") || `<div class="empty-state">${activeFilterCount(v) ? "No quests match these filters." : "Nothing here yet."}</div>`}`;
+}
+
+function viewControls(v) {
+  const n = activeFilterCount(v);
+  const chip = (act, val, label, on) => `<button class="${on ? "on" : ""}" data-act="${act}" data-v="${val}">${label}</button>`;
+  const label = { smart: "Smart", az: "A–Z", level: "Difficulty" }[v.sort];
+  let panel = "";
+  if (S.viewOpen) {
+    panel = `<div class="vpanel">
+      <div class="vlabel">Sort</div>
+      <div class="chipset">${chip("vSort", "smart", "Smart", v.sort === "smart")}${chip("vSort", "az", "A–Z", v.sort === "az")}${chip("vSort", "level", "Difficulty", v.sort === "level")}</div>
+      <div class="vlabel">Difficulty</div>
+      <div class="chipset">${["easy", "medium", "hard"].map((l) => chip("vLevel", l, l[0].toUpperCase() + l.slice(1), v.levels.includes(l))).join("")}</div>
+      <div class="vlabel">Show</div>
+      <div class="chipset">${chip("vSpace", "1", "Has space only", v.space)}</div>
+      ${S.board !== "personal" ? `<div class="vlabel">Team size</div>
+      <div class="chipset">${["any", "2", "3", "4+"].map((z) => chip("vSize", z, z === "any" ? "Any" : z, v.size === z)).join("")}</div>` : ""}
+      ${n || v.sort !== "smart" ? `<button class="btn ghost small" data-act="vReset">Reset</button>` : ""}
+    </div>`;
+  }
+  return `<button class="vtoggle" data-act="vToggle">⚙️ Sort & filter · ${label}${n ? ` · ${n} filter${n > 1 ? "s" : ""}` : ""} ${S.viewOpen ? "▲" : "▼"}</button>${panel}`;
 }
 
 function viewRanks(scores) {
@@ -391,7 +429,7 @@ function renderOverlayInner() {
     const sub = id === GROUP_CHAT ? "Everyone" : isQuest ? (q ? q.members.map(nameOf).join(", ") : "") : "Private chat";
     $overlay.innerHTML = `<div class="scrim" data-act="close"></div>
       <div class="sheet chatsheet" role="dialog">
-        <div class="chathead wrap"><div class="grow"><b>${esc(chatTitle(id))}</b><small>${esc(sub)} · Admin can read this ⚠️</small></div>
+        <div class="chathead wrap"><div class="grow"><b>${esc(chatTitle(id))}</b><small>${esc(sub)} · ${HOST_NAME} can read this ⚠️</small></div>
           <button class="iconbtn" data-act="close" aria-label="Close">✕</button></div>
         <div class="msgs"><div class="wrap">${messagesHtml(S.msgs, S.uid, nameOf)}</div></div>
         <form class="composer wrap" data-act="sendMsg">
@@ -415,13 +453,13 @@ function renderOverlayInner() {
     inner = questSheet(q);
   } else if (S.sheet.kind === "pickPlayer") {
     const others = [...S.players.entries()].filter(([u]) => u !== S.uid).sort((a, b) => a[1].name.localeCompare(b[1].name));
-    inner = `<h3>Message someone</h3><div class="caution">⚠️ Chats can be read by admin. Be warned!</div>
+    inner = `<h3>Message someone</h3><div class="caution">⚠️ Chats can be read by ${HOST_NAME}. Be warned!</div>
       <div class="list">${others.map(([u, p]) => `<button class="hrow chatrow" data-act="dm" data-uid="${u}"><div class="grow"><b>${esc(p.name)}</b></div>✉️</button>`).join("") || `<div class="empty-state">Nobody else yet.</div>`}</div>`;
   } else if (S.sheet.kind === "rules") {
     inner = `<h3>House rules</h3><ul class="rules">${(S.config?.houseRules || []).map((r) => `<li>${esc(r)}</li>`).join("")}</ul>`;
   } else if (S.sheet.kind === "inbox") {
-    inner = `<h3>Give Shalom a sidequest</h3>
-      <p class="sub">Anything fun and harmless. If Shalom completes it, you get ${S.config?.points?.hostQuestReward ?? 10} points.</p>
+    inner = `<h3>Give ${HOST_NAME} a sidequest</h3>
+      <p class="sub">Anything fun and harmless. If ${HOST_NAME} completes it, you get ${S.config?.points?.hostQuestReward ?? 10} points.</p>
       <textarea class="field" id="inboxText" maxlength="500" placeholder="e.g. Start a conga line during the next song"></textarea>
       <label class="check"><input type="checkbox" id="anon"> Send anonymously (no points)</label>
       <button class="btn pink" data-act="sendInbox" ${S.busy ? "disabled" : ""}>Send it</button>`;
@@ -509,7 +547,11 @@ function loadSecret(q) {
 async function busy(fn) {
   if (S.busy) return;
   S.busy = true; render();
-  try { await fn(); } catch (e) { console.error(e); toast(friendly(e)); }
+  try { await fn(); }
+  catch (e) {
+    console.error(e);
+    if (!S.me || !S.linked) S.regError = friendly(e); else toast(friendly(e));
+  }
   S.busy = false; render();
 }
 
@@ -526,27 +568,29 @@ function readForm() {
 async function register() {
   const f = readForm(); if (!f) return;
   await busy(async () => {
-    const user = auth.currentUser;
+    const user = await ensureSession();
+    if (!user.isAnonymous) { S.regError = "This phone is half signed in. Tap Start over below, then try again."; S.linked = true; return; }
     const nref = doc(db, "names", f.lower);
-    if ((await getDoc(nref)).exists()) { S.regError = `"${f.name}" is taken. If that's you, tap Log in.`; return; }
+    if ((await withRetry(() => getDoc(nref))).exists()) { S.regError = `"${f.name}" is taken. If that's you, tap Log in.`; return; }
     const key = newKey();
-    await linkWithCredential(user, EmailAuthProvider.credential(emailFor(key), pwFor(f.pin)));
+    await withRetry(() => linkWithCredential(user, EmailAuthProvider.credential(emailFor(key), pwFor(f.pin))));
     S.linked = true;
-    await runTransaction(db, async (tx) => {
+    await withRetry(() => runTransaction(db, async (tx) => {
       if ((await tx.get(nref)).exists()) throw new Error(`"${f.name}" was just taken. Tap Start over and pick another name.`);
       tx.set(doc(db, "players", user.uid), { name: f.name, nameLower: f.lower, createdAt: serverTimestamp(), adjust: 0 });
       tx.set(nref, { uid: user.uid, key });
-    });
+    }));
   });
 }
 
 async function login() {
   const f = readForm(); if (!f) return;
   await busy(async () => {
-    const ns = await getDoc(doc(db, "names", f.lower));
+    await ensureSession();
+    const ns = await withRetry(() => getDoc(doc(db, "names", f.lower)));
     if (!ns.exists()) { S.regError = `No player called "${f.name}". Check the spelling, or tap I'm new.`; return; }
-    if (!ns.data().key) { S.regError = `${f.name} hasn't set a PIN yet. Open the app on your original phone first, or ask Shalom.`; return; }
-    try { await signInWithEmailAndPassword(auth, emailFor(ns.data().key), pwFor(f.pin)); }
+    if (!ns.data().key) { S.regError = `${f.name} hasn't set a PIN yet. Open the app on your original phone first, or ask ${HOST_NAME}.`; return; }
+    try { await withRetry(() => signInWithEmailAndPassword(auth, emailFor(ns.data().key), pwFor(f.pin))); }
     catch (e) { S.regError = friendly(e); }
   });
 }
@@ -555,8 +599,8 @@ async function setPin() {
   const f = readForm(); if (!f) return;
   await busy(async () => {
     const key = newKey();
-    await linkWithCredential(auth.currentUser, EmailAuthProvider.credential(emailFor(key), pwFor(f.pin)));
-    await updateDoc(doc(db, "names", S.me.nameLower), { key });
+    await withRetry(() => linkWithCredential(auth.currentUser, EmailAuthProvider.credential(emailFor(key), pwFor(f.pin))));
+    await withRetry(() => updateDoc(doc(db, "names", S.me.nameLower), { key }));
     S.linked = true;
     toast("PIN saved 🔐");
   });
@@ -625,7 +669,7 @@ async function sendInbox() {
       text: text.slice(0, 500), createdAt: serverTimestamp(), status: "new",
     });
     S.sheet = null;
-    toast("Sent to Shalom 📨");
+    toast(`Sent to ${HOST_NAME} 📨`);
   });
 }
 
@@ -637,7 +681,7 @@ function bringCard() {
   const summary = items.length ? items.map((i) => `${i.qty}× ${i.item}`).join(", ") : "Nothing requested yet";
   return `<button class="card" data-act="bring" style="margin-top:16px">
     <div class="meta"><span class="badge ${open ? "easy" : ""}">${open ? `open until ${esc(fmtTime(S.config.requestDeadline))}` : "requests closed"}</span></div>
-    <div class="title">🧃 What should I bring for you?</div>
+    <div class="title">🧃 What should ${HOST_NAME} bring for you?</div>
     <div class="blurb">${esc(summary)}</div></button>`;
 }
 function openBring() {
@@ -651,8 +695,8 @@ function bringSheet() {
     return `<h3>Your bring list</h3><p class="sub">Requests are closed. Here's what you asked for:</p>
       ${items.length ? `<div class="list">${items.map((i) => `<div class="shop"><div class="grow"><b>${i.qty}× ${esc(i.item)}</b>${i.note ? `<small>${esc(i.note)}</small>` : ""}</div></div>`).join("")}</div>` : `<div class="empty-state">Nothing requested.</div>`}`;
   }
-  return `<h3>What should Shalom bring for you?</h3>
-    <p class="sub">Open until ${esc(fmtTime(S.config.requestDeadline))}. Only you and admin see this.</p>
+  return `<h3>What should ${HOST_NAME} bring for you?</h3>
+    <p class="sub">Open until ${esc(fmtTime(S.config.requestDeadline))}. Only you and ${HOST_NAME} see this.</p>
     <div class="quick">
       ${PRESETS.map(([icon, name]) => `<button data-act="reqAdd" data-item="${name}">${icon} ${name}</button>`).join("")}
       <button data-act="reqAdd" data-kind="drink">🥤 A drink</button>
@@ -725,19 +769,19 @@ function suggestSheet() {
   const hint = {
     anyone: `Goes on the bonus board for anyone to take. They get ${pts.easy} pts, you get +${pts.suggestBonus} when it's done.`,
     team: `Goes on the bonus board with you already in. Others join to fill it.`,
-    player: `Only they (and admin) see it. They get ${pts.dare} pts if they do it, you get +${pts.suggestBonus}. They can skip it.`,
-    admin: `For Shalom. If Shalom does it, you get ${pts.hostQuestReward} pts.`,
+    player: `Only they (and ${HOST_NAME}) see it. They get ${pts.dare} pts if they do it, you get +${pts.suggestBonus}. They can skip it.`,
+    admin: `For ${HOST_NAME}. If ${HOST_NAME} does it, you get ${pts.hostQuestReward} pts.`,
   }[t];
   return `<h3>Suggest a sidequest</h3>
-    <div class="seg four">${seg("anyone", "Anyone")}${seg("team", "Me + others")}${seg("player", "A player")}${seg("admin", "Admin")}</div>
+    <div class="seg four">${seg("anyone", "Anyone")}${seg("team", "Me + others")}${seg("player", "A player")}${seg("admin", HOST_NAME)}</div>
     <p class="sub" style="font-size:14px">${hint}</p>
     ${t === "player" ? `<select class="field" id="sgTo"><option value="">Who's it for?</option>${others.map(([u, p]) => `<option value="${u}">${esc(p.name)}</option>`).join("")}</select>` : ""}
     <input class="field" id="sgTitle" maxlength="40" placeholder="Quest name, e.g. Human Beatbox">
     <textarea class="field" id="sgDetails" maxlength="300" placeholder="What do they have to do? What counts as done?"></textarea>
     ${t === "anyone" || t === "team" ? `<select class="field" id="sgSize">${sizes.map((n) => `<option value="${n}">${n === 1 ? "Solo (1 player)" : `${n} players`}</option>`).join("")}</select>` : ""}
     ${t === "admin" ? `<label class="check"><input type="checkbox" id="anon"> Send anonymously (no points)</label>` : ""}
-    ${t !== "admin" ? `<div class="caution">⚠️ This goes live straight away. Keep it kind, safe and consensual: no pressuring strangers, no touching without a yes, nothing that could get anyone hurt. Admin can remove anything.</div>` : ""}
-    <button class="btn pink" data-act="sgSend" ${S.busy ? "disabled" : ""}>${t === "admin" ? "Send to Shalom" : "Publish it"}</button>`;
+    ${t !== "admin" ? `<div class="caution">⚠️ This goes live straight away. Keep it kind, safe and consensual: no pressuring strangers, no touching without a yes.</div>` : ""}
+    <button class="btn pink" data-act="sgSend" ${S.busy ? "disabled" : ""}>${t === "admin" ? `Send to ${HOST_NAME}` : "Publish it"}</button>`;
 }
 
 async function sendSuggestion() {
@@ -752,7 +796,7 @@ async function sendSuggestion() {
         fromUid: anon ? null : S.uid, fromName: anon ? null : S.me.name,
         text: (details ? `${title}: ${details}` : title).slice(0, 500), createdAt: serverTimestamp(), status: "new",
       });
-      toast("Sent to Shalom 📨");
+      toast(`Sent to ${HOST_NAME} 📨`);
     } else if (t === "player") {
       const to = document.getElementById("sgTo").value;
       if (!to) throw new Error("Pick who it's for.");
@@ -785,6 +829,12 @@ document.addEventListener("click", (e) => {
   const qid = S.sheet?.id;
   if (act === "tab") { if (S.sheet?.kind === "chat") closeChat(); S.tab = t.dataset.id; S.sheet = null; render(); window.scrollTo(0, 0); }
   else if (act === "board") { S.board = t.dataset.id; render(); }
+  else if (act === "vToggle") { S.viewOpen = !S.viewOpen; render(); }
+  else if (act === "vSort") { S.view.sort = t.dataset.v; render(); }
+  else if (act === "vLevel") { const l = t.dataset.v; S.view.levels = S.view.levels.includes(l) ? S.view.levels.filter((x) => x !== l) : [...S.view.levels, l]; render(); }
+  else if (act === "vSpace") { S.view.space = !S.view.space; render(); }
+  else if (act === "vSize") { S.view.size = t.dataset.v; render(); }
+  else if (act === "vReset") { S.view = { ...DEFAULT_VIEW }; render(); }
   else if (act === "open") { S.sheet = { kind: "quest", id: t.dataset.id }; renderOverlay(); }
   else if (act === "close") { if (S.sheet?.kind === "chat") { closeChat(); S.sheet = null; render(); } else { S.sheet = null; renderOverlay(); } }
   else if (act === "inbox") { S.sheet = { kind: "inbox" }; renderOverlay(); }
