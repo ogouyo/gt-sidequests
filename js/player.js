@@ -1,5 +1,6 @@
 import {
-  makeApp, signInAnonymously, onAuthStateChanged,
+  makeApp, signInAnonymously, onAuthStateChanged, signOut,
+  linkWithCredential, signInWithEmailAndPassword, EmailAuthProvider,
   doc, collection, onSnapshot, getDoc, runTransaction, updateDoc, addDoc, setDoc, deleteDoc, serverTimestamp,
 } from "./firebase.js";
 import {
@@ -15,8 +16,15 @@ const S = {
   sheet: null,          // { kind: 'quest', id } | { kind: 'inbox' }
   secrets: {},          // questId -> { key, text }
   revealed: new Set(),
-  busy: false, regError: "", nameTaken: null,
+  busy: false, regError: "", gateMode: "join", linked: false,
 };
+
+// PIN login: each player gets a hidden email/password account. The email comes from a random key
+// stored on their name, so a removed player can re-register with the same name.
+const emailFor = (key) => `p${key}@players.gt-sidequests.app`;
+const pwFor = (pin) => `gtsq-${pin}`;
+const newKey = () => [...crypto.getRandomValues(new Uint8Array(8))].map((b) => b.toString(16).padStart(2, "0")).join("");
+const cleanName = (n) => n.trim().replace(/\s+/g, " ");
 
 const $root = document.getElementById("root");
 const $overlay = document.getElementById("overlay");
@@ -33,6 +41,10 @@ function toast(msg) {
 }
 function friendly(e) {
   const m = String(e?.code || e?.message || e);
+  if (/invalid-credential|wrong-password|user-not-found|invalid-login/.test(m)) return "Wrong PIN for that name.";
+  if (m.includes("too-many-requests")) return "Too many tries. Wait a few minutes and try again.";
+  if (m.includes("operation-not-allowed")) return "PIN sign-in isn't switched on yet. Tell Shalom.";
+  if (m.includes("network-request-failed")) return "No signal right now. Try again in a moment.";
   if (m.includes("unavailable") || m.includes("offline")) return "No signal right now. Try again in a moment.";
   if (m.includes("permission")) return "That move isn't allowed right now.";
   return e?.message && !e.code ? e.message : "Something went wrong. Try again.";
@@ -43,27 +55,37 @@ function reason(r) {
 }
 
 /* ---------- auth + data ---------- */
+let unsubs = [];
+const spinner = `<div class="center"><div class="spinner"></div></div>`;
 onAuthStateChanged(auth, (user) => {
   if (!user) {
+    S.uid = null;
+    unsubs.forEach((f) => f()); unsubs = [];
+    $root.innerHTML = spinner; $overlay.innerHTML = "";
     signInAnonymously(auth).catch((e) => {
       $root.innerHTML = `<div class="wrap center"><div><h1>Can't connect</h1><p class="sub">${esc(friendly(e))}</p></div></div>`;
     });
     return;
   }
-  if (S.uid === user.uid) return;
-  S.uid = user.uid;
+  S.linked = !user.isAnonymous;
+  if (S.uid === user.uid) { render(); return; }
+  // A different person on this phone: start fresh.
+  unsubs.forEach((f) => f()); unsubs = [];
+  Object.assign(S, { uid: user.uid, me: undefined, claim: undefined, secrets: {}, revealed: new Set(), sheet: null, tab: "mine", regError: "" });
+  $root.innerHTML = spinner; $overlay.innerHTML = "";
   listen();
 });
 
 function listen() {
-  onSnapshot(doc(db, "players", S.uid), (s) => { S.me = s.exists() ? s.data() : null; render(); });
-  onSnapshot(doc(db, "claims", S.uid), (s) => { S.claim = s.exists() ? s.data() : null; render(); }, () => { S.claim = null; render(); });
-  onSnapshot(doc(db, "config", "game"), (s) => { S.config = s.exists() ? s.data() : null; render(); });
-  onSnapshot(collection(db, "players"), (snap) => {
+  const on = (...a) => unsubs.push(onSnapshot(...a));
+  on(doc(db, "players", S.uid), (s) => { S.me = s.exists() ? s.data() : null; render(); });
+  on(doc(db, "claims", S.uid), (s) => { S.claim = s.exists() ? s.data() : null; render(); }, () => { S.claim = null; render(); });
+  on(doc(db, "config", "game"), (s) => { S.config = s.exists() ? s.data() : null; render(); });
+  on(collection(db, "players"), (snap) => {
     S.players = new Map(snap.docs.map((d) => [d.id, d.data()]));
     render();
   });
-  onSnapshot(collection(db, "quests"), (snap) => {
+  on(collection(db, "quests"), (snap) => {
     S.quests = snap.docs.map((d) => ({ id: d.id, members: [], twistDone: [], ...d.data() }))
       .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
     render();
@@ -75,7 +97,7 @@ function listen() {
 function preserve(fn) {
   const active = document.activeElement?.id;
   const vals = {};
-  for (const id of ["nameInput", "note", "inboxText"]) { const el = document.getElementById(id); if (el) vals[id] = el.value; }
+  for (const id of ["nameInput", "pinInput", "note", "inboxText"]) { const el = document.getElementById(id); if (el) vals[id] = el.value; }
   const anon = document.getElementById("anon")?.checked;
   fn();
   for (const id in vals) { const el = document.getElementById(id); if (el) el.value = vals[id]; }
@@ -86,7 +108,7 @@ function preserve(fn) {
 function render() { preserve(renderNow); }
 function renderNow() {
   if (S.uid === null || S.me === undefined) return;
-  if (!S.me) { renderGate(); renderOverlayNow(); return; }
+  if (!S.me || !S.linked) { renderGate(); renderOverlayNow(); return; }
   const scores = computeScores(S.quests, S.players, S.config);
   const myScore = scores.get(S.uid) || 0;
   let body = "";
@@ -108,29 +130,42 @@ function renderNow() {
 const tabBtn = (id, icon, label) => `<button class="tab ${S.tab === id ? "on" : ""}" data-act="tab" data-id="${id}"><b>${icon}</b>${label}</button>`;
 
 function renderGate() {
+  const pinField = `<input class="field" id="pinInput" type="password" inputmode="numeric" pattern="[0-9]*" maxlength="4" autocomplete="off" placeholder="4-digit PIN" style="margin-top:10px">`;
+  if (S.me && !S.linked) {
+    // Signed up before PINs existed: set one once.
+    $root.innerHTML = `<div class="wrap"><div class="hero"><h1>Hey ${esc(S.me.name)}</h1>
+      <p class="sub">Set a 4-digit PIN. You'll use it with your name to log back in on any phone, or after handing your phone to a friend.</p></div>
+      <form data-act="setPin">${pinField}<div class="err">${esc(S.regError)}</div>
+      <button class="btn primary" ${S.busy ? "disabled" : ""}>Save my PIN</button></form></div>`;
+    return;
+  }
   if (S.claim) {
     $root.innerHTML = `<div class="wrap center"><div>
       <div class="spinner" style="margin:0 auto 18px"></div>
       <h1>Hold tight, ${esc(S.claim.name)}</h1>
       <p class="sub">Shalom needs to confirm it's you on this phone. Ping them, then this screen will update by itself.</p>
-      <button class="btn ghost" style="margin-top:20px" data-act="cancelClaim">That's not me, pick another name</button>
+      <button class="btn ghost" style="margin-top:20px" data-act="cancelClaim">Cancel</button>
     </div></div>`;
     return;
   }
+  const join = S.gateMode === "join";
   const rules = S.config?.houseRules || [];
+  const seg = (id, label) => `<button type="button" class="${S.gateMode === id ? "on" : ""}" data-act="gateMode" data-id="${id}">${label}</button>`;
   $root.innerHTML = `<div class="wrap">
     <div class="hero"><h1>GT<span>SIDEQUESTS</span></h1>
       <p class="sub">Little missions for the night. Pick your quests, team up with people you don't know yet, cause some (friendly) chaos.</p></div>
-    <h2>House rules</h2>
-    <ul class="rules">${rules.map((r) => `<li>${esc(r)}</li>`).join("")}</ul>
-    <h2>What should we call you?</h2>
-    <form data-act="register">
-      <input class="field" id="nameInput" maxlength="20" autocomplete="nickname" placeholder="Your name or nickname" value="${esc(S.nameTaken || "")}">
+    <div class="seg">${seg("join", "I'm new")}${seg("login", "Log in")}</div>
+    ${join ? `<h2>House rules</h2><ul class="rules">${rules.map((r) => `<li>${esc(r)}</li>`).join("")}</ul>
+      <h2>Pick a name and a PIN</h2>` : `<h2>Welcome back</h2>`}
+    <form data-act="${join ? "register" : "login"}">
+      <input class="field" id="nameInput" maxlength="20" autocomplete="off" placeholder="${join ? "Your name or nickname" : "Your name"}">
+      ${pinField}
       <div class="err">${esc(S.regError)}</div>
-      ${S.nameTaken ? `<button type="button" class="btn" data-act="claim" style="margin-bottom:10px">That's me, I'm on a new phone</button>` : ""}
-      <button class="btn primary" ${S.busy ? "disabled" : ""}>I agree, let's go</button>
+      <button class="btn primary" ${S.busy ? "disabled" : ""}>${join ? "I agree, let's go" : "Log in"}</button>
     </form>
-    <p class="sub" style="margin:18px 0 40px;font-size:13px">Tip: open this link in Chrome or Safari, not inside WhatsApp, so it remembers you.</p>
+    ${join ? `<p class="sub" style="margin-top:12px;font-size:13px">Remember your PIN. You'll need it to log back in.</p>` : ""}
+    ${S.linked ? `<button class="btn ghost small" style="margin-top:12px" data-act="logout">Start over</button>` : ""}
+    <p class="sub" style="margin:18px 0 40px;font-size:13px">Tip: open this link in Chrome or Safari, not inside WhatsApp.</p>
   </div>`;
 }
 
@@ -180,7 +215,10 @@ function viewMine() {
     ${core.length ? `<h2>Core quests</h2>${core.map(questCard).join("")}` : ""}
     ${m.bonus.length ? `<h2>Bonus quests</h2>${m.bonus.map(questCard).join("")}` : ""}
     ${!core.length && !m.bonus.length ? `<div class="empty-state">No quests yet. The board is where the fun starts.</div>` : ""}
-    <button class="btn ghost small" style="margin:24px auto 0" data-act="rules">📜 House rules</button>`;
+    <div class="row" style="margin-top:24px">
+      <button class="btn ghost small" data-act="rules">📜 House rules</button>
+      <button class="btn ghost small" data-act="logout">↩ Log out</button>
+    </div>`;
 }
 
 function viewBoard() {
@@ -331,29 +369,58 @@ async function busy(fn) {
   S.busy = false; render();
 }
 
+function readForm() {
+  const name = cleanName(document.getElementById("nameInput")?.value || "");
+  const pin = (document.getElementById("pinInput")?.value || "").trim();
+  S.regError = "";
+  if (document.getElementById("nameInput") && (name.length < 2 || name.length > 20)) S.regError = "Use a name with 2 to 20 characters.";
+  else if (!/^\d{4}$/.test(pin)) S.regError = "Your PIN must be exactly 4 digits.";
+  if (S.regError) { render(); return null; }
+  return { name, lower: name.toLowerCase(), pin };
+}
+
 async function register() {
-  const name = document.getElementById("nameInput").value.trim().replace(/\s+/g, " ");
-  S.regError = ""; S.nameTaken = null;
-  if (name.length < 2 || name.length > 20) { S.regError = "Use 2 to 20 characters."; render(); return; }
-  const lower = name.toLowerCase();
+  const f = readForm(); if (!f) return;
   await busy(async () => {
-    try {
-      await runTransaction(db, async (tx) => {
-        const nref = doc(db, "names", lower);
-        if ((await tx.get(nref)).exists()) throw new Error("TAKEN");
-        tx.set(doc(db, "players", S.uid), { name, nameLower: lower, createdAt: serverTimestamp(), adjust: 0 });
-        tx.set(nref, { uid: S.uid });
-      });
-    } catch (e) {
-      if (e.message === "TAKEN") { S.regError = `"${name}" is already taken.`; S.nameTaken = name; return; }
-      throw e;
-    }
+    const user = auth.currentUser;
+    const nref = doc(db, "names", f.lower);
+    if ((await getDoc(nref)).exists()) { S.regError = `"${f.name}" is taken. If that's you, tap Log in.`; return; }
+    const key = newKey();
+    await linkWithCredential(user, EmailAuthProvider.credential(emailFor(key), pwFor(f.pin)));
+    S.linked = true;
+    await runTransaction(db, async (tx) => {
+      if ((await tx.get(nref)).exists()) throw new Error(`"${f.name}" was just taken. Tap Start over and pick another name.`);
+      tx.set(doc(db, "players", user.uid), { name: f.name, nameLower: f.lower, createdAt: serverTimestamp(), adjust: 0 });
+      tx.set(nref, { uid: user.uid, key });
+    });
   });
 }
 
-async function claim() {
-  const name = S.nameTaken;
-  await busy(() => setDoc(doc(db, "claims", S.uid), { name, nameLower: name.toLowerCase(), createdAt: serverTimestamp() }));
+async function login() {
+  const f = readForm(); if (!f) return;
+  await busy(async () => {
+    const ns = await getDoc(doc(db, "names", f.lower));
+    if (!ns.exists()) { S.regError = `No player called "${f.name}". Check the spelling, or tap I'm new.`; return; }
+    if (!ns.data().key) { S.regError = `${f.name} hasn't set a PIN yet. Open the app on your original phone first, or ask Shalom.`; return; }
+    try { await signInWithEmailAndPassword(auth, emailFor(ns.data().key), pwFor(f.pin)); }
+    catch (e) { S.regError = friendly(e); }
+  });
+}
+
+async function setPin() {
+  const f = readForm(); if (!f) return;
+  await busy(async () => {
+    const key = newKey();
+    await linkWithCredential(auth.currentUser, EmailAuthProvider.credential(emailFor(key), pwFor(f.pin)));
+    await updateDoc(doc(db, "names", S.me.nameLower), { key });
+    S.linked = true;
+    toast("PIN saved 🔐");
+  });
+}
+
+async function logout() {
+  if (!window.confirm("Log out? You'll need your name and PIN to get back in.")) return;
+  await signOut(auth);
 }
 
 async function join(id) {
@@ -436,12 +503,17 @@ document.addEventListener("click", (e) => {
   else if (act === "complete") complete(qid);
   else if (act === "undo") undo(qid);
   else if (act === "sendInbox") sendInbox();
-  else if (act === "claim") claim();
+  else if (act === "logout") logout();
+  else if (act === "gateMode") { S.gateMode = t.dataset.id; S.regError = ""; render(); }
   else if (act === "cancelClaim") deleteDoc(doc(db, "claims", S.uid)).catch((er) => toast(friendly(er)));
 });
 document.addEventListener("change", (e) => {
   if (e.target.dataset.act === "twist") toggleTwist(S.sheet.id, e.target.checked);
 });
 document.addEventListener("submit", (e) => {
-  if (e.target.dataset.act === "register") { e.preventDefault(); register(); }
+  const act = e.target.dataset.act;
+  if (["register", "login", "setPin"].includes(act)) e.preventDefault();
+  if (act === "register") register();
+  if (act === "login") login();
+  if (act === "setPin") setPin();
 });

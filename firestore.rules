@@ -35,10 +35,15 @@ service cloud.firestore {
     match /names/{nameLower} {
       allow read: if signedIn();
       allow create: if signedIn()
-        && request.resource.data.keys().hasOnly(['uid'])
+        && request.resource.data.keys().hasOnly(['uid', 'key'])
         && request.resource.data.uid == me()
         && getAfter(/databases/$(database)/documents/players/$(me())).data.nameLower == nameLower;
-      allow update, delete: if isHost();
+      // A player who signed up before PINs existed may add their PIN key once.
+      allow update: if isHost() || (signedIn()
+        && resource.data.uid == me()
+        && !('key' in resource.data)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['key']));
+      allow delete: if isHost();
     }
 
     // "That's me on a new phone" requests, approved by the host.
