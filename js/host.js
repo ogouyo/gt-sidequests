@@ -82,6 +82,9 @@ function render() {
   // Keep the edit form's typed values when live data re-renders.
   const keep = {};
   $overlay.querySelectorAll("[name]").forEach((el) => (keep[el.name] = el.value));
+  const rulesEl = document.getElementById("rulesText");
+  const rulesDraft = rulesEl && rulesEl.dataset.dirty ? rulesEl.value : null;
+  const rulesFocused = document.activeElement === rulesEl;
   $root.innerHTML = `
     <header class="topbar"><div class="wrap">
       <div class="logo">GT <span>HOST</span></div>
@@ -93,6 +96,9 @@ function render() {
     </div></main>`;
   renderOverlay();
   $overlay.querySelectorAll("[name]").forEach((el) => { if (el.name in keep) el.value = keep[el.name]; });
+  const newRules = document.getElementById("rulesText");
+  if (newRules && rulesDraft !== null) { newRules.value = rulesDraft; newRules.dataset.dirty = "1"; }
+  if (newRules && rulesFocused) newRules.focus();
 }
 
 function viewSetup() {
@@ -135,6 +141,11 @@ function viewOverview() {
 
     ${S.claims.length ? `<h2>New-phone requests</h2><div class="list">${S.claims.map((c) => `<div class="hrow"><div class="grow"><b>${esc(c.name)}</b><small>says they're on a new phone</small></div>
       <button class="btn small primary" data-act="approve" data-id="${c.id}">Approve</button><button class="btn small danger" data-act="deny" data-id="${c.id}">Deny</button></div>`).join("")}</div>` : ""}
+
+    <h2>House rules</h2>
+    <textarea class="field" id="rulesText" style="min-height:200px">${esc((S.config?.houseRules || []).join("\n"))}</textarea>
+    <p class="sub" style="font-size:13px;margin-bottom:8px">One rule per line. Players see these on their welcome screen.</p>
+    <button class="btn primary" data-act="saveRules">Save house rules</button>
 
     <h2>Data</h2>
     <div class="row"><button class="btn" data-act="import">Re-import quests.json</button></div>
@@ -377,6 +388,14 @@ document.addEventListener("click", (e) => {
     deny: () => run(() => deleteDoc(doc(db, "claims", id))),
     resetProgress: () => run(resetProgress),
     resetAll: () => run(resetAll),
+    saveRules: () => run(async () => {
+      const el = document.getElementById("rulesText");
+      const rules = el.value.split("\n").map((r) => r.trim()).filter(Boolean);
+      if (!rules.length) return toast("Add at least one rule.");
+      delete el.dataset.dirty;
+      await setDoc(doc(db, "config", "game"), { houseRules: rules }, { merge: true });
+      toast("House rules saved");
+    }),
     inboxDone: () => run(async () => {
       const i = S.inbox.find((x) => x.id === id);
       const b = writeBatch(db);
@@ -387,6 +406,8 @@ document.addEventListener("click", (e) => {
     inboxDismiss: () => run(() => updateDoc(doc(db, "inbox", id), { status: "dismissed" })),
   })[act]?.();
 });
+
+document.addEventListener("input", (e) => { if (e.target.id === "rulesText") e.target.dataset.dirty = "1"; });
 
 document.addEventListener("change", (e) => {
   const t = e.target;

@@ -179,7 +179,8 @@ function viewMine() {
     ${todo}
     ${core.length ? `<h2>Core quests</h2>${core.map(questCard).join("")}` : ""}
     ${m.bonus.length ? `<h2>Bonus quests</h2>${m.bonus.map(questCard).join("")}` : ""}
-    ${!core.length && !m.bonus.length ? `<div class="empty-state">No quests yet. The board is where the fun starts.</div>` : ""}`;
+    ${!core.length && !m.bonus.length ? `<div class="empty-state">No quests yet. The board is where the fun starts.</div>` : ""}
+    <button class="btn ghost small" style="margin:24px auto 0" data-act="rules">📜 House rules</button>`;
 }
 
 function viewBoard() {
@@ -238,6 +239,8 @@ function renderOverlayNow() {
     const q = qById(S.sheet.id);
     if (!q) { S.sheet = null; $overlay.innerHTML = ""; return; }
     inner = questSheet(q);
+  } else if (S.sheet.kind === "rules") {
+    inner = `<h3>House rules</h3><ul class="rules">${(S.config?.houseRules || []).map((r) => `<li>${esc(r)}</li>`).join("")}</ul>`;
   } else if (S.sheet.kind === "inbox") {
     inner = `<h3>Give Shalom a sidequest</h3>
       <p class="sub">Anything fun and harmless. If Shalom completes it, you get ${S.config?.points?.hostQuestReward ?? 10} points.</p>
@@ -426,6 +429,7 @@ document.addEventListener("click", (e) => {
   else if (act === "open") { S.sheet = { kind: "quest", id: t.dataset.id }; renderOverlay(); }
   else if (act === "close") { S.sheet = null; renderOverlay(); }
   else if (act === "inbox") { S.sheet = { kind: "inbox" }; renderOverlay(); }
+  else if (act === "rules") { S.sheet = { kind: "rules" }; renderOverlay(); }
   else if (act === "reveal") { t.classList.toggle("shown"); S.revealed[t.classList.contains("shown") ? "add" : "delete"](qid); }
   else if (act === "join") join(qid);
   else if (act === "leave") leave(qid);
