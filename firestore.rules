@@ -1,0 +1,125 @@
+rules_version = '2';
+// GT Sidequests security rules. Paste into Firebase console > Firestore > Rules, then Publish.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function me() { return request.auth.uid; }
+    function isHost() {
+      return signedIn()
+        && request.auth.token.email == 'ejimahshalom@gmail.com'
+        && request.auth.token.email_verified == true;
+    }
+    function cfg() { return get(/databases/$(database)/documents/config/game).data; }
+    function changedOnly(keys) { return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys); }
+    function symDiff(a, b) { return a.toSet().difference(b.toSet()).union(b.toSet().difference(a.toSet())); }
+    function validName(n) { return n is string && n.size() >= 2 && n.size() <= 20; }
+
+    match /config/{id} {
+      allow read: if signedIn();
+      allow write: if isHost();
+    }
+
+    match /players/{uid} {
+      allow read: if signedIn();
+      allow create: if signedIn() && me() == uid
+        && request.resource.data.keys().hasOnly(['name', 'nameLower', 'createdAt', 'adjust'])
+        && validName(request.resource.data.name)
+        && request.resource.data.nameLower == request.resource.data.name.lower()
+        && request.resource.data.adjust == 0
+        && request.resource.data.createdAt == request.time;
+      allow update, delete: if isHost();
+    }
+
+    // One doc per lowercase name, so names stay unique.
+    match /names/{nameLower} {
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['uid'])
+        && request.resource.data.uid == me()
+        && getAfter(/databases/$(database)/documents/players/$(me())).data.nameLower == nameLower;
+      allow update, delete: if isHost();
+    }
+
+    // "That's me on a new phone" requests, approved by the host.
+    match /claims/{uid} {
+      allow read: if isHost() || (signedIn() && me() == uid);
+      allow create: if signedIn() && me() == uid
+        && request.resource.data.keys().hasOnly(['name', 'nameLower', 'createdAt'])
+        && validName(request.resource.data.name)
+        && request.resource.data.nameLower == request.resource.data.name.lower()
+        && request.resource.data.createdAt == request.time;
+      allow delete: if isHost() || (signedIn() && me() == uid);
+      allow update: if isHost();
+    }
+
+    // Sidequests sent to the host.
+    match /inbox/{id} {
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['fromUid', 'fromName', 'text', 'createdAt', 'status'])
+        && (request.resource.data.fromUid == null || request.resource.data.fromUid == me())
+        && request.resource.data.text is string
+        && request.resource.data.text.size() >= 1 && request.resource.data.text.size() <= 500
+        && request.resource.data.status == 'new'
+        && request.resource.data.createdAt == request.time;
+      allow read, update, delete: if isHost();
+    }
+
+    match /quests/{qid} {
+      allow read: if signedIn();
+      allow create, delete: if isHost();
+      allow update: if isHost() || joinQuest() || leaveQuest() || setStatus() || toggleTwist();
+
+      // Players may only add themselves, at the end of the list, while there is room.
+      function joinQuest() {
+        let o = resource.data;
+        let n = request.resource.data;
+        return signedIn() && changedOnly(['members'])
+          && !(me() in o.members)
+          && n.members == o.members.concat([me()])
+          && n.members.size() <= o.max
+          && o.active == true && o.status == 'open'
+          && (o.pool == 'bonus' || cfg().pickingOpen == true);
+      }
+      // Players may only remove themselves.
+      function leaveQuest() {
+        let o = resource.data;
+        let n = request.resource.data;
+        return signedIn() && changedOnly(['members'])
+          && (me() in o.members)
+          && n.members.size() == o.members.size() - 1
+          && symDiff(n.members, o.members) == [me()].toSet()
+          && o.status == 'open'
+          && (o.pool == 'bonus' || cfg().pickingOpen == true);
+      }
+      // Any member of a full-enough team can mark it done (or undo).
+      function setStatus() {
+        let o = resource.data;
+        let n = request.resource.data;
+        return signedIn() && (me() in o.members) && o.members.size() >= o.min
+          && changedOnly(['status', 'note', 'completedBy', 'completedAt'])
+          && n.status in ['open', 'done']
+          && n.note is string && n.note.size() <= 280;
+      }
+      // Each member ticks their own secret twist.
+      function toggleTwist() {
+        let o = resource.data;
+        let n = request.resource.data;
+        return signedIn() && (me() in o.members)
+          && changedOnly(['twistDone'])
+          && symDiff(n.twistDone, o.twistDone) == [me()].toSet();
+      }
+    }
+
+    // Secret twists: slot i belongs to the i-th member to join. A quest with one twist shares it.
+    match /questSecrets/{qid}/slots/{slot} {
+      allow read: if isHost() || canSeeSlot(qid, slot);
+      allow write: if isHost();
+    }
+    function canSeeSlot(qid, slot) {
+      let q = get(/databases/$(database)/documents/quests/$(qid)).data;
+      return signedIn() && (me() in q.members) && q.members.size() >= q.min
+        && (q.twistCount == 1 || (int(slot) < q.members.size() && q.members[int(slot)] == me()));
+    }
+  }
+}
