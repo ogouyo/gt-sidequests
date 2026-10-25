@@ -1,6 +1,6 @@
 // Pure game logic shared by the player app and the host dashboard.
 
-export const DEFAULT_POINTS = { easy: 10, medium: 20, hard: 30, twistBonus: 10, hostQuestReward: 10 };
+export const DEFAULT_POINTS = { easy: 10, medium: 20, hard: 30, twistBonus: 10, hostQuestReward: 10, dare: 10, suggestBonus: 5 };
 
 export const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
@@ -75,7 +75,7 @@ export function canLeave(q, uid, config) {
   return q.pool === "bonus" || !!config?.pickingOpen;
 }
 
-export function computeScores(quests, players, config) {
+export function computeScores(quests, players, config, dares = []) {
   const pts = { ...DEFAULT_POINTS, ...(config?.points || {}) };
   const score = new Map();
   for (const [uid, p] of players) score.set(uid, Number(p.adjust || 0));
@@ -86,6 +86,14 @@ export function computeScores(quests, players, config) {
       if ((q.twistDone || []).includes(uid)) s += pts.twistBonus;
       score.set(uid, (score.get(uid) || 0) + s);
     }
+    // Whoever suggested a quest gets a small bonus when others complete it.
+    if (q.suggestedBy && !q.members.includes(q.suggestedBy) && players.has(q.suggestedBy))
+      score.set(q.suggestedBy, (score.get(q.suggestedBy) || 0) + pts.suggestBonus);
+  }
+  for (const d of dares) {
+    if (d.status !== "done") continue;
+    if (players.has(d.to)) score.set(d.to, (score.get(d.to) || 0) + pts.dare);
+    if (players.has(d.from)) score.set(d.from, (score.get(d.from) || 0) + pts.suggestBonus);
   }
   return score;
 }

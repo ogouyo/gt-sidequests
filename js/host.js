@@ -1,7 +1,9 @@
 import {
   makeApp, HOST_EMAIL, onAuthStateChanged, signInWithPopup, signInWithRedirect, signInWithCredential, signOut, GoogleAuthProvider,
-  doc, collection, onSnapshot, getDoc, getDocs, writeBatch, updateDoc, setDoc, deleteDoc, increment,
+  doc, collection, onSnapshot, getDoc, getDocs, writeBatch, updateDoc, setDoc, deleteDoc, increment, serverTimestamp,
+  query, orderBy, limitToLast,
 } from "./firebase.js";
+import { ms, messagesHtml, keepScroll, GROUP_CHAT } from "./chat.js";
 import { esc, sizeLabel, questState, slotText, myQuests, coreProgress, computeScores, slotMath } from "./game.js";
 
 const { auth, db } = makeApp("host", { offline: false });
@@ -9,11 +11,14 @@ const { auth, db } = makeApp("host", { offline: false });
 const S = {
   user: undefined, config: null, quests: [], players: new Map(), claims: [], inbox: [],
   tab: "overview", qfilter: "group", sheet: null, busy: false, listening: false,
+  chats: [], msgs: [], requests: [], dares: [], dareText: {}, shopping: {}, defaulted: false,
 };
+// Default bring-list deadline: Thursday 29 October 2026, 11:59pm Lagos time.
+const DEFAULT_DEADLINE = new Date("2026-10-29T23:59:00+01:00");
 const $root = document.getElementById("root");
 const $overlay = document.getElementById("overlay");
 const $toast = document.getElementById("toast");
-const nameOf = (uid) => S.players.get(uid)?.name || "(unknown)";
+const nameOf = (uid) => (uid === "admin" ? "Admin" : S.players.get(uid)?.name || "(unknown)");
 const qById = (id) => S.quests.find((q) => q.id === id);
 let tt;
 const toast = (m) => { $toast.innerHTML = `<div class="toast">${esc(m)}</div>`; clearTimeout(tt); tt = setTimeout(() => ($toast.innerHTML = ""), 3000); };
@@ -43,13 +48,28 @@ if (new URLSearchParams(location.search).has("emu")) {
 
 function listen() {
   S.listening = true;
-  onSnapshot(doc(db, "config", "game"), (s) => { S.config = s.exists() ? s.data() : null; render(); });
+  onSnapshot(doc(db, "config", "game"), (s) => {
+    S.config = s.exists() ? s.data() : null;
+    if (S.config && !S.config.requestDeadline && !S.defaulted) {
+      S.defaulted = true;
+      setDoc(doc(db, "config", "game"), { requestDeadline: DEFAULT_DEADLINE }, { merge: true });
+    }
+    render();
+  });
+  onSnapshot(doc(db, "config", "shopping"), (s) => { S.shopping = s.exists() ? s.data().checked || {} : {}; render(); });
+  onSnapshot(collection(db, "requests"), (snap) => { S.requests = snap.docs.map((d) => ({ uid: d.id, ...d.data() })); render(); });
+  onSnapshot(collection(db, "dares"), (snap) => { S.dares = snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => ms(b.createdAt) - ms(a.createdAt)); render(); });
+  onSnapshot(collection(db, "dareText"), (snap) => { S.dareText = Object.fromEntries(snap.docs.map((d) => [d.id, d.data()])); render(); });
   onSnapshot(collection(db, "quests"), (snap) => {
     S.quests = snap.docs.map((d) => ({ id: d.id, members: [], twistDone: [], ...d.data() })).sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
     render();
   });
   onSnapshot(collection(db, "players"), (snap) => { S.players = new Map(snap.docs.map((d) => [d.id, d.data()])); render(); });
   onSnapshot(collection(db, "claims"), (snap) => { S.claims = snap.docs.map((d) => ({ id: d.id, ...d.data() })); render(); });
+  onSnapshot(collection(db, "chats"), (snap) => {
+    S.chats = snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => ms(b.lastAt) - ms(a.lastAt));
+    render();
+  });
   onSnapshot(collection(db, "inbox"), (snap) => {
     S.inbox = snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
     render();
@@ -79,26 +99,33 @@ function render() {
   else if (S.tab === "quests") body = viewQuests();
   else if (S.tab === "players") body = viewPlayers();
   else if (S.tab === "inbox") body = viewInbox();
+  else if (S.tab === "chats") body = viewChats();
+  else if (S.tab === "bring") body = viewBring();
   // Keep the edit form's typed values when live data re-renders.
   const keep = {};
   $overlay.querySelectorAll("[name]").forEach((el) => (keep[el.name] = el.value));
-  const rulesEl = document.getElementById("rulesText");
-  const rulesDraft = rulesEl && rulesEl.dataset.dirty ? rulesEl.value : null;
-  const rulesFocused = document.activeElement === rulesEl;
+  const drafts = {};
+  for (const id of ["rulesText", "deadline", "hostMsg"]) {
+    const el = document.getElementById(id);
+    if (el && (el.dataset.dirty || id === "hostMsg")) drafts[id] = { v: el.value, f: document.activeElement === el };
+  }
   $root.innerHTML = `
     <header class="topbar"><div class="wrap">
       <div class="logo">GT <span>HOST</span></div>
       <button class="btn small ghost" data-act="logout">Sign out</button>
     </div></header>
     <main><div class="wrap">
-      <div class="seg">${t("overview", "Overview")}${t("quests", "Quests")}${t("players", `Players (${S.players.size})`)}${t("inbox", `Inbox${newInbox ? ` (${newInbox})` : ""}`)}</div>
+      <div class="seg">${t("overview", "Overview")}${t("quests", "Quests")}${t("players", `Players (${S.players.size})`)}${t("chats", "Chats")}${t("bring", "Bring list")}${t("inbox", `Inbox${newInbox ? ` (${newInbox})` : ""}`)}</div>
       ${body}
     </div></main>`;
   renderOverlay();
   $overlay.querySelectorAll("[name]").forEach((el) => { if (el.name in keep) el.value = keep[el.name]; });
-  const newRules = document.getElementById("rulesText");
-  if (newRules && rulesDraft !== null) { newRules.value = rulesDraft; newRules.dataset.dirty = "1"; }
-  if (newRules && rulesFocused) newRules.focus();
+  for (const [id, d] of Object.entries(drafts)) {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    el.value = d.v; if (id !== "hostMsg") el.dataset.dirty = "1";
+    if (d.f) el.focus();
+  }
 }
 
 function viewSetup() {
@@ -184,7 +211,7 @@ function viewQuests() {
 }
 
 function viewPlayers() {
-  const scores = computeScores(S.quests, S.players, S.config);
+  const scores = computeScores(S.quests, S.players, S.config, S.dares);
   const rows = [...S.players.entries()].sort((a, b) => (scores.get(b[0]) || 0) - (scores.get(a[0]) || 0));
   if (!rows.length) return `<div class="empty-state">No players yet. Share the link from the Overview tab.</div>`;
   return `<div class="list">${rows.map(([uid, p]) => {
@@ -201,20 +228,126 @@ function viewPlayers() {
 }
 
 function viewInbox() {
-  if (!S.inbox.length) return `<div class="empty-state">No sidequests for you yet. They'll show up here.</div>`;
   const reward = S.config?.points?.hostQuestReward ?? 10;
-  return S.inbox.map((i) => `<div class="card ${i.status !== "new" ? "done" : ""}">
+  const made = S.quests.filter((q) => q.suggestedBy);
+  const extra = `
+    <h2>Player-made quests (${made.length})</h2>
+    ${made.length ? `<div class="list">${made.map((q) => `<div class="hrow"><div class="grow"><b>${esc(q.title)}</b>
+      <small>by ${esc(nameOf(q.suggestedBy))} · ${q.type === "personal" ? "solo" : q.max + " players"} · ${esc(slotText(q))}</small>${q.blurb ? `<small>${esc(q.blurb)}</small>` : ""}</div>
+      <button class="btn small" data-act="edit" data-id="${q.id}">Edit</button><button class="btn small danger" data-act="delSuggested" data-id="${q.id}">Remove</button></div>`).join("")}</div>`
+      : `<div class="empty-state">None yet.</div>`}
+    <h2>Dares between players (${S.dares.length})</h2>
+    ${S.dares.length ? `<div class="list">${S.dares.map((d) => `<div class="hrow"><div class="grow"><b>${esc(S.dareText[d.id]?.title || "…")}</b>
+      <small>${esc(nameOf(d.from))} → ${esc(nameOf(d.to))} · ${d.status}</small>${S.dareText[d.id]?.details ? `<small>${esc(S.dareText[d.id].details)}</small>` : ""}</div>
+      <button class="btn small danger" data-act="delDare" data-id="${d.id}">Remove</button></div>`).join("")}</div>`
+      : `<div class="empty-state">None yet.</div>`}`;
+  if (!S.inbox.length) return `<h2>Sidequests for you</h2><div class="empty-state">None yet.</div>${extra}`;
+  return `<h2>Sidequests for you</h2>` + S.inbox.map((i) => `<div class="card ${i.status !== "new" ? "done" : ""}">
     <div class="meta"><span class="badge">${i.fromName ? esc(i.fromName) : "Anonymous"}</span>${i.status !== "new" ? `<span class="badge">${i.status}</span>` : ""}</div>
     <div class="title">${esc(i.text)}</div>
     ${i.status === "new" ? `<div class="row" style="margin-top:10px">
       <button class="btn small primary" data-act="inboxDone" data-id="${i.id}">I did it${i.fromUid ? ` (+${reward} to ${esc(i.fromName)})` : ""}</button>
       <button class="btn small" data-act="inboxDismiss" data-id="${i.id}">Dismiss</button></div>` : ""}
-  </div>`).join("");
+  </div>`).join("") + extra;
+}
+
+async function hostSend() {
+  const el = document.getElementById("hostMsg");
+  const text = el.value.trim().slice(0, 500);
+  if (!text) return;
+  el.value = "";
+  const b = writeBatch(db);
+  b.set(doc(collection(db, "chats", GROUP_CHAT, "messages")), { from: "admin", text, at: serverTimestamp() });
+  b.set(doc(db, "chats", GROUP_CHAT), { lastAt: serverTimestamp(), lastFrom: "admin", lastText: text.slice(0, 80) });
+  await b.commit();
+}
+
+/* ---------- bring list ---------- */
+const toLocalInput = (d) => { const z = new Date(d - d.getTimezoneOffset() * 60000); return z.toISOString().slice(0, 16); };
+function viewBring() {
+  const dl = S.config?.requestDeadline ? new Date(ms(S.config.requestDeadline)) : DEFAULT_DEADLINE;
+  const open = Date.now() < dl.getTime();
+  const groups = new Map();
+  for (const r of S.requests) for (const it of r.items || []) {
+    const key = (it.kind === "drink" ? "drink:" : "") + it.item.trim().toLowerCase();
+    if (!groups.has(key)) groups.set(key, { key, label: (it.kind === "drink" ? "🥤 " : "") + it.item.trim(), total: 0, people: [] });
+    const g = groups.get(key);
+    g.total += it.qty; g.people.push(`${nameOf(r.uid)} ${it.qty}${it.note ? ` (${it.note})` : ""}`);
+  }
+  const list = [...groups.values()].sort((a, b) => b.total - a.total);
+  const people = S.requests.filter((r) => (r.items || []).length);
+  return `
+    <h2>Deadline</h2>
+    <div class="linkbox"><input class="field" type="datetime-local" id="deadline" value="${toLocalInput(dl)}"><button class="btn small primary" data-act="saveDeadline">Save</button></div>
+    <p class="sub" style="font-size:13px">${open ? "🟢 Open." : "🔴 Closed."} Players can add or change requests until then. Set a later time to reopen.</p>
+    <h2>Shopping list · ${people.length} of ${S.players.size} players asked</h2>
+    ${list.length ? `<div class="list">${list.map((g) => `<label class="shop ${S.shopping[g.key] ? "got" : ""}">
+      <input type="checkbox" data-act="shopTick" data-key="${esc(g.key)}" ${S.shopping[g.key] ? "checked" : ""}>
+      <div class="grow"><b>${g.total}× ${esc(g.label)}</b><small>${esc(g.people.join(" · "))}</small></div></label>`).join("")}</div>`
+      : `<div class="empty-state">No requests yet.</div>`}
+    ${people.length ? `<h2>By person</h2><div class="list">${people.map((r) => `<div class="hrow"><div class="grow"><b>${esc(nameOf(r.uid))}</b>
+      <small>${esc(r.items.map((i) => `${i.qty}× ${i.item}${i.note ? ` (${i.note})` : ""}`).join(", "))}</small></div></div>`).join("")}</div>` : ""}`;
 }
 
 /* ---------- edit sheet ---------- */
+function chatTitle(id) {
+  if (id === GROUP_CHAT) return "📣 Everyone";
+  if (id.startsWith("q_")) return `💬 ${S.quests.find((q) => q.id === id.slice(2))?.title || "Quest chat"}`;
+  return `✉️ ${id.slice(2).split("_").map(nameOf).join(" ↔ ")}`;
+}
+
+function viewChats() {
+  const hasGroup = S.chats.some((c) => c.id === GROUP_CHAT);
+  const groupBtn = hasGroup ? "" : `<button class="btn primary" data-act="openChat" data-id="${GROUP_CHAT}" style="margin-bottom:12px">📣 Post in the Everyone chat</button>`;
+  if (!S.chats.length) return `${groupBtn}<div class="empty-state">No chats yet. Team chats and private messages will show up here.</div>`;
+  return `${groupBtn}<button class="btn small" data-act="exportChats" style="margin-bottom:12px">⬇ Download all chats (.txt)</button>
+    <div class="list">${S.chats.map((c) => `<button class="hrow chatrow" data-act="openChat" data-id="${c.id}">
+      <div class="grow"><b>${esc(chatTitle(c.id))}</b><small>${esc(nameOf(c.lastFrom))}: ${esc(c.lastText || "")}</small></div>
+      <small style="color:var(--muted)">${c.lastAt ? new Date(ms(c.lastAt)).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : ""}</small></button>`).join("")}</div>`;
+}
+
+let msgUnsub = null;
+function openChat(id) {
+  if (msgUnsub) msgUnsub();
+  S.msgs = []; S.sheet = { kind: "chat", id };
+  msgUnsub = onSnapshot(query(collection(db, "chats", id, "messages"), orderBy("at"), limitToLast(1000)), (snap) => {
+    S.msgs = snap.docs.map((d) => d.data({ serverTimestamps: "estimate" }));
+    renderOverlay();
+  });
+  renderOverlay();
+}
+
+async function exportChats() {
+  const lines = [];
+  for (const c of S.chats) {
+    const snap = await getDocs(query(collection(db, "chats", c.id, "messages"), orderBy("at")));
+    lines.push(`=== ${chatTitle(c.id).replace(/^\S+ /, "")} ===`);
+    snap.forEach((d) => { const m = d.data(); lines.push(`[${new Date(ms(m.at)).toLocaleString()}] ${nameOf(m.from)}: ${m.text}`); });
+    lines.push("");
+  }
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([lines.join("\n")], { type: "text/plain" }));
+  a.download = "gt-sidequests-chats.txt";
+  a.click();
+}
+
 function renderOverlay() {
+  const el = $overlay.querySelector("#hostMsg");
+  const v = el?.value, f = document.activeElement === el;
+  keepScroll($overlay, renderOverlayInner);
+  const ne = $overlay.querySelector("#hostMsg");
+  if (ne && v !== undefined) { ne.value = v; if (f) ne.focus(); }
+}
+function renderOverlayInner() {
   if (!S.sheet) { $overlay.innerHTML = ""; return; }
+  if (S.sheet.kind === "chat") {
+    $overlay.innerHTML = `<div class="scrim" data-act="close"></div>
+      <div class="sheet chatsheet"><div class="chathead wrap"><div class="grow"><b>${esc(chatTitle(S.sheet.id))}</b><small>${S.sheet.id === GROUP_CHAT ? "You post as 📣 Admin" : "Read-only"} · ${S.msgs.length} messages</small></div>
+        <button class="iconbtn" data-act="close">✕</button></div>
+        <div class="msgs"><div class="wrap">${messagesHtml(S.msgs, "admin", nameOf)}</div></div>
+        ${S.sheet.id === GROUP_CHAT ? `<form class="composer wrap" data-act="hostSend"><input class="field" id="hostMsg" name="hostMsg" maxlength="500" autocomplete="off" placeholder="Announcement to everyone"><button class="btn primary small">Send</button></form>` : ""}</div>`;
+    return;
+  }
   const q = S.sheet.q;
   const sel = (name, opts, v) => `<select class="field" name="${name}">${opts.map((o) => `<option ${o === v ? "selected" : ""}>${o}</option>`).join("")}</select>`;
   $overlay.innerHTML = `<div class="scrim" data-act="close"></div>
@@ -345,14 +478,28 @@ async function resetProgress() {
 }
 
 async function resetAll() {
-  if (!confirm("Remove ALL players, their names and the inbox, and clear quest progress?")) return;
+  if (!confirm("Remove ALL players, their names, the inbox, chats, bring requests, dares and player-made quests, and clear quest progress?")) return;
   const b = writeBatch(db);
   S.quests.forEach((q) => b.update(doc(db, "quests", q.id), blankState()));
   S.players.forEach((p, uid) => b.delete(doc(db, "players", uid)));
   (await getDocs(collection(db, "names"))).forEach((d) => b.delete(d.ref));
   S.claims.forEach((c) => b.delete(doc(db, "claims", c.id)));
   S.inbox.forEach((i) => b.delete(doc(db, "inbox", i.id)));
-  await b.commit(); toast("Everything cleared");
+  await b.commit();
+  // Chats, requests, dares, player-made quests: delete in chunks (a batch holds at most 500 writes).
+  const refs = [];
+  S.requests.forEach((r) => refs.push(doc(db, "requests", r.uid)));
+  S.dares.forEach((d) => { refs.push(doc(db, "dares", d.id)); refs.push(doc(db, "dareText", d.id)); });
+  S.quests.filter((q) => q.suggestedBy).forEach((q) => refs.push(doc(db, "quests", q.id)));
+  refs.push(doc(db, "config", "shopping"));
+  for (const c of S.chats) {
+    (await getDocs(collection(db, "chats", c.id, "messages"))).forEach((d) => refs.push(d.ref));
+    refs.push(doc(db, "chats", c.id));
+  }
+  for (let i = 0; i < refs.length; i += 400) {
+    const cb = writeBatch(db); refs.slice(i, i + 400).forEach((r) => cb.delete(r)); await cb.commit();
+  }
+  toast("Everything cleared");
 }
 
 async function run(fn) {
@@ -372,7 +519,21 @@ document.addEventListener("click", (e) => {
     import: () => document.getElementById("importFile").click(),
     edit: () => run(() => openEdit(id)),
     newQuest: () => { S.sheet = { isNew: true, twists: [], q: { title: "", blurb: "", type: "group", pool: "bonus", level: "easy", category: "", min: 2, max: 2, instructions: [], doneWhen: "" } }; renderOverlay(); },
-    close: () => { S.sheet = null; renderOverlay(); },
+    close: () => { if (msgUnsub) { msgUnsub(); msgUnsub = null; } S.sheet = null; renderOverlay(); },
+    openChat: () => openChat(id),
+    saveDeadline: () => run(async () => {
+      const el = document.getElementById("deadline");
+      if (!el.value) return toast("Pick a date and time.");
+      delete el.dataset.dirty;
+      await setDoc(doc(db, "config", "game"), { requestDeadline: new Date(el.value) }, { merge: true });
+      toast("Deadline saved");
+    }),
+    delSuggested: () => run(async () => { if (confirm("Remove this player-made quest?")) await deleteDoc(doc(db, "quests", id)); }),
+    delDare: () => run(async () => {
+      if (!confirm("Remove this dare?")) return;
+      const b = writeBatch(db); b.delete(doc(db, "dares", id)); b.delete(doc(db, "dareText", id)); await b.commit();
+    }),
+    exportChats: () => run(exportChats),
     saveQuest: () => run(saveQuest),
     deleteQuest: () => run(async () => {
       if (!confirm("Delete this quest for good?")) return;
@@ -407,12 +568,16 @@ document.addEventListener("click", (e) => {
   })[act]?.();
 });
 
-document.addEventListener("input", (e) => { if (e.target.id === "rulesText") e.target.dataset.dirty = "1"; });
+document.addEventListener("input", (e) => { if (["rulesText", "deadline"].includes(e.target.id)) e.target.dataset.dirty = "1"; });
+document.addEventListener("submit", (e) => {
+  if (e.target.dataset.act === "hostSend") { e.preventDefault(); run(hostSend); }
+});
 
 document.addEventListener("change", (e) => {
   const t = e.target;
   if (t.id === "importFile" && t.files[0]) { run(() => importFile(t.files[0])); t.value = ""; return; }
   const { act, id, key } = t.dataset;
+  if (act === "shopTick") run(() => setDoc(doc(db, "config", "shopping"), { checked: { [t.dataset.key]: t.checked } }, { merge: true }));
   if (act === "active") run(() => updateDoc(doc(db, "quests", id), { active: t.checked }));
   if (act === "cfg" && key === "pickingOpen") run(() => setDoc(doc(db, "config", "game"), { pickingOpen: t.checked }, { merge: true }));
   if (act === "cfg" && key === "noRepeatTeammates") run(() => setDoc(doc(db, "config", "game"), { picking: { noRepeatTeammates: t.checked } }, { merge: true }));

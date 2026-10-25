@@ -43,7 +43,7 @@ a { color: var(--cyan); }
 
 /* Bottom tab bar */
 .tabbar { position: fixed; left: 0; right: 0; bottom: 0; z-index: 20; background: rgba(12, 12, 22, .95); backdrop-filter: blur(12px); border-top: 1px solid var(--line); padding-bottom: var(--safe-b); }
-.tabbar .wrap { display: grid; grid-template-columns: repeat(3, 1fr); }
+.tabbar .wrap { display: grid; grid-template-columns: repeat(4, 1fr); }
 .tab { padding: 10px 0 12px; display: flex; flex-direction: column; align-items: center; gap: 2px; color: var(--muted); font-size: 12px; font-weight: 600; }
 .tab b { font-size: 20px; line-height: 1.2; font-weight: 400; }
 .tab.on { color: var(--lime); }
@@ -179,3 +179,48 @@ label.check input { width: 22px; height: 22px; accent-color: var(--lime); }
 .linkbox { display: flex; gap: 8px; }
 .linkbox input { flex: 1; min-width: 0; }
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+
+/* Chat */
+.tab b { position: relative; }
+.badgecount { position: absolute; top: -4px; right: -12px; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: var(--pink); color: #0b0b0b; font-size: 11px; font-weight: 700; font-style: normal; line-height: 18px; text-align: center; }
+.chatrow { width: 100%; text-align: left; }
+.chatrow small { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 70vw; }
+.dot { width: 10px; height: 10px; border-radius: 50%; background: var(--pink); box-shadow: 0 0 10px var(--pink); flex: none; }
+.rank .iconbtn { width: 36px; height: 36px; font-size: 16px; }
+.chatsheet { height: 92dvh; display: flex; flex-direction: column; padding: 0; overflow: hidden; }
+.chathead { display: flex; align-items: center; gap: 10px; padding-top: 14px; padding-bottom: 12px; border-bottom: 1px solid var(--line); width: 100%; }
+.chathead .grow { flex: 1; min-width: 0; }
+.chathead small { display: block; color: var(--muted); font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.msgs { flex: 1; overflow-y: auto; padding: 12px 0; -webkit-overflow-scrolling: touch; }
+.msgs .wrap { display: flex; flex-direction: column; gap: 6px; }
+.bubble { max-width: 80%; align-self: flex-start; background: var(--card2); border: 1px solid var(--line); border-radius: 16px 16px 16px 4px; padding: 8px 12px; font-size: 15px; word-wrap: break-word; }
+.bubble.mine { align-self: flex-end; background: var(--lime); color: #0b0b0b; border-color: var(--lime); border-radius: 16px 16px 4px 16px; }
+.bubble .who { font-size: 12px; font-weight: 700; color: var(--cyan); margin-bottom: 2px; }
+.bubble .t { font-size: 10.5px; opacity: .6; text-align: right; margin-top: 2px; }
+.composer { display: flex; gap: 8px; padding-top: 10px; padding-bottom: calc(12px + var(--safe-b)); border-top: 1px solid var(--line); background: var(--bg2); width: 100%; }
+.composer .field { flex: 1; min-width: 0; padding: 12px 14px; }
+.composer .btn { min-height: 46px; }
+.bubble.admin { border-color: var(--pink); background: rgba(255, 79, 163, .12); }
+.bubble.admin .who { color: var(--pink); }
+
+/* Suggest + bring + dares */
+.caution { border: 1px solid rgba(255, 200, 61, .45); background: rgba(255, 200, 61, .08); color: var(--amber); border-radius: 12px; padding: 10px 12px; font-size: 13.5px; }
+.seg.four { grid-auto-columns: 1fr; }
+.seg.four button { font-size: 13px; padding: 9px 2px; }
+.quick { display: flex; flex-wrap: wrap; gap: 8px; }
+.quick button { padding: 8px 12px; border-radius: 999px; background: var(--card2); border: 1px solid var(--line); font-weight: 600; font-size: 14px; }
+.reqrow { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 10px; display: grid; gap: 8px; }
+.reqrow .top { display: flex; gap: 8px; align-items: center; }
+.reqrow .top .field { flex: 1; min-width: 0; padding: 10px 12px; }
+.reqrow .note-in { padding: 8px 12px; font-size: 14px; }
+.stepper { display: flex; align-items: center; gap: 4px; }
+.stepper button { width: 34px; height: 34px; border-radius: 10px; background: var(--card2); border: 1px solid var(--line); font-weight: 700; }
+.stepper span { min-width: 22px; text-align: center; font-weight: 700; }
+.dare .from { font-size: 13px; color: var(--pink); font-weight: 700; }
+.dare.closed { opacity: .55; }
+.shop { display: flex; gap: 10px; align-items: flex-start; padding: 12px 14px; }
+.shop input { width: 22px; height: 22px; accent-color: var(--lime); margin-top: 2px; flex: none; }
+.shop .grow small { display: block; color: var(--muted); font-size: 13px; }
+.shop.got .grow b { text-decoration: line-through; opacity: .6; }
+.host .seg { overflow-x: auto; grid-auto-columns: max-content; scrollbar-width: none; }
+.host .seg button { padding: 10px 12px; white-space: nowrap; }

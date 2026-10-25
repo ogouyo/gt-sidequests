@@ -2,7 +2,9 @@ import {
   makeApp, signInAnonymously, onAuthStateChanged, signOut,
   linkWithCredential, signInWithEmailAndPassword, EmailAuthProvider,
   doc, collection, onSnapshot, getDoc, runTransaction, updateDoc, addDoc, setDoc, deleteDoc, serverTimestamp,
+  query, where, orderBy, limitToLast, writeBatch,
 } from "./firebase.js";
+import { questChatId, dmChatId, ms, messagesHtml, keepScroll, GROUP_CHAT } from "./chat.js";
 import {
   esc, sizeLabel, questState, slotText, myQuests, coreProgress, canJoin, canLeave, computeScores,
 } from "./game.js";
@@ -17,7 +19,17 @@ const S = {
   secrets: {},          // questId -> { key, text }
   revealed: new Set(),
   busy: false, regError: "", gateMode: "join", linked: false,
+  dmChats: new Map(),     // chatId -> chat doc (private messages)
+  questChats: new Map(),  // chatId -> chat doc (team chats for my quests)
+  msgs: [],               // messages of the open chat
+  groupChat: null,        // the Everyone chat doc
+  dares: [],              // all dares (who/status only)
+  dareText: {},           // dareId -> { title, details } (only mine)
+  myRequest: undefined,   // my bring-list doc
 };
+const PRESETS = [["💧", "Water"], ["🍬", "Gum"], ["🩴", "Slippers"], ["💊", "Painkillers"]];
+let questChatUnsubs = new Map();
+let msgUnsub = null;
 
 // PIN login: each player gets a hidden email/password account. The email comes from a random key
 // stored on their name, so a removed player can re-register with the same name.
@@ -31,7 +43,9 @@ const $overlay = document.getElementById("overlay");
 const $toast = document.getElementById("toast");
 
 /* ---------- helpers ---------- */
-const nameOf = (uid) => S.players.get(uid)?.name || "Someone";
+const nameOf = (uid) => (uid === "admin" ? "Admin" : S.players.get(uid)?.name || "Someone");
+const fmtTime = (t) => new Date(ms(t)).toLocaleString([], { weekday: "short", day: "numeric", month: "short", hour: "numeric", minute: "2-digit" });
+const requestsOpen = () => !!S.config?.requestDeadline && Date.now() < ms(S.config.requestDeadline);
 const qById = (id) => S.quests.find((q) => q.id === id);
 let toastTimer;
 function toast(msg) {
@@ -61,6 +75,8 @@ onAuthStateChanged(auth, (user) => {
   if (!user) {
     S.uid = null;
     unsubs.forEach((f) => f()); unsubs = [];
+    questChatUnsubs.forEach((f) => f()); questChatUnsubs = new Map();
+    if (msgUnsub) { msgUnsub(); msgUnsub = null; }
     $root.innerHTML = spinner; $overlay.innerHTML = "";
     signInAnonymously(auth).catch((e) => {
       $root.innerHTML = `<div class="wrap center"><div><h1>Can't connect</h1><p class="sub">${esc(friendly(e))}</p></div></div>`;
@@ -71,7 +87,9 @@ onAuthStateChanged(auth, (user) => {
   if (S.uid === user.uid) { render(); return; }
   // A different person on this phone: start fresh.
   unsubs.forEach((f) => f()); unsubs = [];
-  Object.assign(S, { uid: user.uid, me: undefined, claim: undefined, secrets: {}, revealed: new Set(), sheet: null, tab: "mine", regError: "" });
+  Object.assign(S, { uid: user.uid, me: undefined, claim: undefined, secrets: {}, revealed: new Set(), sheet: null, tab: "mine", regError: "", dmChats: new Map(), questChats: new Map(), msgs: [], groupChat: null, dares: [], dareText: {}, myRequest: undefined });
+  questChatUnsubs.forEach((f) => f()); questChatUnsubs = new Map();
+  if (msgUnsub) { msgUnsub(); msgUnsub = null; }
   $root.innerHTML = spinner; $overlay.innerHTML = "";
   listen();
 });
@@ -88,8 +106,96 @@ function listen() {
   on(collection(db, "quests"), (snap) => {
     S.quests = snap.docs.map((d) => ({ id: d.id, members: [], twistDone: [], ...d.data() }))
       .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+    syncQuestChats();
     render();
   });
+  on(query(collection(db, "chats"), where("members", "array-contains", S.uid)), (snap) => {
+    S.dmChats = new Map(snap.docs.map((d) => [d.id, d.data()]));
+    render();
+  }, () => {});
+  on(doc(db, "chats", GROUP_CHAT), (s) => { S.groupChat = s.exists() ? s.data() : null; render(); }, () => {});
+  on(collection(db, "dares"), (snap) => {
+    S.dares = snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => ms(b.createdAt) - ms(a.createdAt));
+    render();
+  }, () => {});
+  on(doc(db, "requests", S.uid), (s) => { S.myRequest = s.exists() ? s.data() : null; render(); }, () => { S.myRequest = null; });
+}
+
+// Watch the team chat of every group quest I'm in (for unread dots).
+function syncQuestChats() {
+  const want = new Set(S.quests.filter((q) => q.type === "group" && q.members.includes(S.uid)).map((q) => questChatId(q.id)));
+  for (const [id, off] of questChatUnsubs) if (!want.has(id)) { off(); questChatUnsubs.delete(id); S.questChats.delete(id); }
+  for (const id of want) {
+    if (questChatUnsubs.has(id)) continue;
+    questChatUnsubs.set(id, onSnapshot(doc(db, "chats", id), (s) => {
+      if (s.exists()) S.questChats.set(id, s.data()); else S.questChats.delete(id);
+      render();
+    }, () => {}));
+  }
+}
+
+/* ---------- chat ---------- */
+const seenKey = (id) => `gtsq:seen:${S.uid}:${id}`;
+function seenAt(id) { try { return Number(localStorage.getItem(seenKey(id))) || 0; } catch { return 0; } }
+function markSeen(id) { try { localStorage.setItem(seenKey(id), String(Date.now())); } catch {} }
+function isUnread(id, chat) { return !!chat && chat.lastFrom !== S.uid && ms(chat.lastAt) > seenAt(id); }
+function unreadCount() {
+  let n = 0;
+  for (const [id, c] of [...S.dmChats, ...S.questChats, [GROUP_CHAT, S.groupChat]]) if (isUnread(id, c) && S.sheet?.id !== id) n++;
+  return n;
+}
+function chatTitle(id) {
+  if (id === GROUP_CHAT) return "📣 Everyone";
+  if (id.startsWith("q_")) return qById(id.slice(2))?.title || "Team chat";
+  const other = id.slice(2).split("_").find((u) => u !== S.uid);
+  return nameOf(other);
+}
+function openChat(id) {
+  if (msgUnsub) msgUnsub();
+  S.msgs = [];
+  S.sheet = { kind: "chat", id };
+  markSeen(id);
+  msgUnsub = onSnapshot(query(collection(db, "chats", id, "messages"), orderBy("at"), limitToLast(300)), (snap) => {
+    S.msgs = snap.docs.map((d) => d.data({ serverTimestamps: "estimate" }));
+    if (S.sheet?.id === id) markSeen(id);
+    render();
+  }, (e) => toast(friendly(e)));
+  render();
+}
+function closeChat() { if (msgUnsub) { msgUnsub(); msgUnsub = null; } S.msgs = []; }
+
+async function sendMsg() {
+  const el = document.getElementById("chatInput");
+  const text = (el?.value || "").trim().slice(0, 500);
+  if (!text) return;
+  el.value = "";
+  const id = S.sheet.id;
+  const b = writeBatch(db);
+  b.set(doc(collection(db, "chats", id, "messages")), { from: S.uid, text, at: serverTimestamp() });
+  const meta = { lastAt: serverTimestamp(), lastFrom: S.uid, lastText: text.slice(0, 80) };
+  if (id.startsWith("d_")) meta.members = id.slice(2).split("_");
+  b.set(doc(db, "chats", id), meta);
+  b.commit().catch((e) => { toast(friendly(e)); });
+  el.focus();
+}
+
+function viewChats() {
+  const row = (id, chat, title, sub) => `<button class="hrow chatrow" data-act="chat" data-id="${id}">
+    <div class="grow"><b>${esc(title)}</b><small>${esc(chat?.lastText ? `${chat.lastFrom === S.uid ? "You: " : ""}${chat.lastText}` : sub)}</small></div>
+    ${isUnread(id, chat) ? `<span class="dot"></span>` : ""}</button>`;
+  const mineQ = S.quests.filter((q) => q.type === "group" && q.members.includes(S.uid));
+  const dms = [...S.dmChats.entries()].sort((a, b) => ms(b[1].lastAt) - ms(a[1].lastAt));
+  return `
+    <h1>Chats</h1>
+    <div class="caution">⚠️ Chats can be read by admin. Be warned!</div>
+    <h2>Group</h2>
+    <div class="list">${row(GROUP_CHAT, S.groupChat, chatTitle(GROUP_CHAT), "Everyone playing, plus admin announcements")}</div>
+    <h2>Team chats</h2>
+    ${mineQ.length ? `<div class="list">${mineQ.map((q) => row(questChatId(q.id), S.questChats.get(questChatId(q.id)), q.title, "Chat with your team")).join("")}</div>`
+      : `<div class="empty-state">Join a group quest to get a team chat.</div>`}
+    <h2>Private messages</h2>
+    ${dms.length ? `<div class="list">${dms.map(([id, c]) => row(id, c, chatTitle(id), "")).join("")}</div>` : ""}
+    <button class="btn" style="margin-top:12px" data-act="pickPlayer">✉️ New message</button>`;
 }
 
 /* ---------- rendering ---------- */
@@ -97,7 +203,7 @@ function listen() {
 function preserve(fn) {
   const active = document.activeElement?.id;
   const vals = {};
-  for (const id of ["nameInput", "pinInput", "note", "inboxText"]) { const el = document.getElementById(id); if (el) vals[id] = el.value; }
+  for (const id of ["nameInput", "pinInput", "note", "inboxText", "chatInput", "sgTitle", "sgDetails", "sgTo", "sgSize"]) { const el = document.getElementById(id); if (el) vals[id] = el.value; }
   const anon = document.getElementById("anon")?.checked;
   fn();
   for (const id in vals) { const el = document.getElementById(id); if (el) el.value = vals[id]; }
@@ -109,25 +215,27 @@ function render() { preserve(renderNow); }
 function renderNow() {
   if (S.uid === null || S.me === undefined) return;
   if (!S.me || !S.linked) { renderGate(); renderOverlayNow(); return; }
-  const scores = computeScores(S.quests, S.players, S.config);
+  const scores = computeScores(S.quests, S.players, S.config, S.dares);
   const myScore = scores.get(S.uid) || 0;
   let body = "";
   if (S.tab === "mine") body = viewMine();
   if (S.tab === "board") body = viewBoard();
   if (S.tab === "ranks") body = viewRanks(scores);
+  if (S.tab === "chats") body = viewChats();
+  const unread = unreadCount();
   $root.innerHTML = `
     <header class="topbar"><div class="wrap">
       <div class="logo">GT <span>SIDEQUESTS</span></div>
       <span class="pill lime">⚡ ${myScore}</span>
     </div></header>
     <main><div class="wrap">${body}</div></main>
-    <button class="fab" data-act="inbox">＋ Quest for Shalom</button>
+    <button class="fab" data-act="suggest">＋ Suggest a sidequest</button>
     <nav class="tabbar"><div class="wrap">
-      ${tabBtn("mine", "🎯", "My quests")}${tabBtn("board", "🗺️", "Board")}${tabBtn("ranks", "🏆", "Ranks")}
+      ${tabBtn("mine", "🎯", "My quests", openDaresForMe().length)}${tabBtn("board", "🗺️", "Board")}${tabBtn("chats", "💬", "Chats", unread)}${tabBtn("ranks", "🏆", "Ranks")}
     </div></nav>`;
   renderOverlayNow();
 }
-const tabBtn = (id, icon, label) => `<button class="tab ${S.tab === id ? "on" : ""}" data-act="tab" data-id="${id}"><b>${icon}</b>${label}</button>`;
+const tabBtn = (id, icon, label, badge = 0) => `<button class="tab ${S.tab === id ? "on" : ""}" data-act="tab" data-id="${id}"><b>${icon}${badge ? `<i class="badgecount">${badge}</i>` : ""}</b>${label}</button>`;
 
 function renderGate() {
   const pinField = `<input class="field" id="pinInput" type="password" inputmode="numeric" pattern="[0-9]*" maxlength="4" autocomplete="off" placeholder="4-digit PIN" style="margin-top:10px">`;
@@ -212,6 +320,8 @@ function viewMine() {
     <p class="sub">${prog.allDone ? "Core quests cleared. Bonus quests are unlocked on the board." : `${prog.done} of ${prog.needed} core quests done`}</p>
     <div class="progress">${pips}</div>
     ${todo}
+    ${bringCard()}
+    ${daresSection()}
     ${core.length ? `<h2>Core quests</h2>${core.map(questCard).join("")}` : ""}
     ${m.bonus.length ? `<h2>Bonus quests</h2>${m.bonus.map(questCard).join("")}` : ""}
     ${!core.length && !m.bonus.length ? `<div class="empty-state">No quests yet. The board is where the fun starts.</div>` : ""}
@@ -261,6 +371,7 @@ function viewRanks(scores) {
     <div class="list">${rows.map((r, i) => `<div class="rank">
       <span class="n">${i + 1}</span>
       <span class="who">${esc(r.name)}${r.uid === S.uid ? " (you)" : ""}<small>${r.prog.done}/${r.prog.needed} core done</small></span>
+      ${r.uid !== S.uid ? `<button class="iconbtn" data-act="dm" data-uid="${r.uid}" aria-label="Message ${esc(r.name)}">✉️</button>` : ""}
       <span class="pts">${r.score}</span></div>`).join("")}</div>
     <h2>Recently completed</h2>
     ${feed.length ? `<div class="list">${feed.map((q) => `<div class="feed">
@@ -270,13 +381,42 @@ function viewRanks(scores) {
 
 /* ---------- overlay (quest sheet + inbox) ---------- */
 function renderOverlay() { preserve(renderOverlayNow); }
-function renderOverlayNow() {
+function renderOverlayNow() { keepScroll($overlay, renderOverlayInner); }
+function renderOverlayInner() {
   if (!S.sheet || !S.me) { $overlay.innerHTML = ""; return; }
+  if (S.sheet.kind === "chat") {
+    const id = S.sheet.id;
+    const isQuest = id.startsWith("q_");
+    const q = isQuest ? qById(id.slice(2)) : null;
+    const sub = id === GROUP_CHAT ? "Everyone" : isQuest ? (q ? q.members.map(nameOf).join(", ") : "") : "Private chat";
+    $overlay.innerHTML = `<div class="scrim" data-act="close"></div>
+      <div class="sheet chatsheet" role="dialog">
+        <div class="chathead wrap"><div class="grow"><b>${esc(chatTitle(id))}</b><small>${esc(sub)} · Admin can read this ⚠️</small></div>
+          <button class="iconbtn" data-act="close" aria-label="Close">✕</button></div>
+        <div class="msgs"><div class="wrap">${messagesHtml(S.msgs, S.uid, nameOf)}</div></div>
+        <form class="composer wrap" data-act="sendMsg">
+          <input class="field" id="chatInput" maxlength="500" autocomplete="off" placeholder="Message">
+          <button class="btn primary small">Send</button>
+        </form>
+      </div>`;
+    return;
+  }
+  if (S.sheet.kind === "bring") {
+    // Rendered only on demand so typing isn't interrupted by live updates.
+    if ($overlay.querySelector(".bringsheet") && !S.sheet.redraw) return;
+    S.sheet.redraw = false;
+  }
   let inner = "";
-  if (S.sheet.kind === "quest") {
+  if (S.sheet.kind === "bring") inner = bringSheet();
+  else if (S.sheet.kind === "suggest") inner = suggestSheet();
+  else if (S.sheet.kind === "quest") {
     const q = qById(S.sheet.id);
     if (!q) { S.sheet = null; $overlay.innerHTML = ""; return; }
     inner = questSheet(q);
+  } else if (S.sheet.kind === "pickPlayer") {
+    const others = [...S.players.entries()].filter(([u]) => u !== S.uid).sort((a, b) => a[1].name.localeCompare(b[1].name));
+    inner = `<h3>Message someone</h3><div class="caution">⚠️ Chats can be read by admin. Be warned!</div>
+      <div class="list">${others.map(([u, p]) => `<button class="hrow chatrow" data-act="dm" data-uid="${u}"><div class="grow"><b>${esc(p.name)}</b></div>✉️</button>`).join("") || `<div class="empty-state">Nobody else yet.</div>`}</div>`;
   } else if (S.sheet.kind === "rules") {
     inner = `<h3>House rules</h3><ul class="rules">${(S.config?.houseRules || []).map((r) => `<li>${esc(r)}</li>`).join("")}</ul>`;
   } else if (S.sheet.kind === "inbox") {
@@ -287,7 +427,7 @@ function renderOverlayNow() {
       <button class="btn pink" data-act="sendInbox" ${S.busy ? "disabled" : ""}>Send it</button>`;
   }
   $overlay.innerHTML = `<div class="scrim" data-act="close"></div>
-    <div class="sheet" role="dialog"><div class="grab"></div>
+    <div class="sheet ${S.sheet.kind === "bring" ? "bringsheet" : ""}" role="dialog"><div class="grab"></div>
       <button class="iconbtn closex" data-act="close" aria-label="Close">✕</button>
       <div class="wrap">${inner}</div></div>`;
 }
@@ -326,11 +466,14 @@ function questSheet(q) {
     action = `<div class="box win"><div class="label">✓ Completed${q.completedBy ? ` · marked by ${esc(nameOf(q.completedBy))}` : ""}</div>${q.note ? esc(q.note) : "No note."}</div>
       <button class="btn ghost small" data-act="undo">Undo, we're not done</button>`;
   } else if (st === "forming") {
-    action = `<div class="note">Waiting for ${q.min - q.members.length} more ${q.min - q.members.length > 1 ? "people" : "person"} to join. Hype it in the group chat.</div>`;
+    action = `<div class="note">Waiting for ${q.min - q.members.length} more ${q.min - q.members.length > 1 ? "people" : "person"} to join. Hype it in the Everyone chat.</div>
+      <button class="btn small" data-act="chat" data-id="${GROUP_CHAT}">📣 Open the Everyone chat</button>`;
   } else {
     action = `<textarea class="field" id="note" maxlength="280" placeholder="What happened? (optional, shows on the leaderboard)"></textarea>
       <button class="btn primary" data-act="complete" ${S.busy ? "disabled" : ""}>Mark as complete</button>`;
   }
+  const chatBtn = mine && q.type === "group"
+    ? `<button class="btn" data-act="chat" data-id="${questChatId(q.id)}">💬 Team chat${isUnread(questChatId(q.id), S.questChats.get(questChatId(q.id))) ? " · new" : ""}</button>` : "";
   const leave = mine && canLeave(q, S.uid, S.config)
     ? `<button class="btn ghost small danger" data-act="leave">Leave this quest</button>` : "";
   return `
@@ -345,6 +488,7 @@ function questSheet(q) {
     <div class="box win"><div class="label">Done when</div>${esc(q.doneWhen)}</div>
     ${twist}
     ${action}
+    ${chatBtn}
     ${leave}`;
 }
 
@@ -485,18 +629,188 @@ async function sendInbox() {
   });
 }
 
+/* ---------- bring list ---------- */
+function bringCard() {
+  if (!S.config?.requestDeadline) return "";
+  const items = S.myRequest?.items || [];
+  const open = requestsOpen();
+  const summary = items.length ? items.map((i) => `${i.qty}× ${i.item}`).join(", ") : "Nothing requested yet";
+  return `<button class="card" data-act="bring" style="margin-top:16px">
+    <div class="meta"><span class="badge ${open ? "easy" : ""}">${open ? `open until ${esc(fmtTime(S.config.requestDeadline))}` : "requests closed"}</span></div>
+    <div class="title">🧃 What should I bring for you?</div>
+    <div class="blurb">${esc(summary)}</div></button>`;
+}
+function openBring() {
+  S.sheet = { kind: "bring", items: JSON.parse(JSON.stringify(S.myRequest?.items || [])), redraw: true };
+  renderOverlay();
+}
+function bringSheet() {
+  const open = requestsOpen();
+  const items = S.sheet.items;
+  if (!open) {
+    return `<h3>Your bring list</h3><p class="sub">Requests are closed. Here's what you asked for:</p>
+      ${items.length ? `<div class="list">${items.map((i) => `<div class="shop"><div class="grow"><b>${i.qty}× ${esc(i.item)}</b>${i.note ? `<small>${esc(i.note)}</small>` : ""}</div></div>`).join("")}</div>` : `<div class="empty-state">Nothing requested.</div>`}`;
+  }
+  return `<h3>What should Shalom bring for you?</h3>
+    <p class="sub">Open until ${esc(fmtTime(S.config.requestDeadline))}. Only you and admin see this.</p>
+    <div class="quick">
+      ${PRESETS.map(([icon, name]) => `<button data-act="reqAdd" data-item="${name}">${icon} ${name}</button>`).join("")}
+      <button data-act="reqAdd" data-kind="drink">🥤 A drink</button>
+      <button data-act="reqAdd" data-kind="other">＋ Something else</button>
+    </div>
+    ${items.length ? items.map((it, i) => `<div class="reqrow">
+      <div class="top">
+        <input class="field" id="req-item-${i}" data-req="${i}" data-f="item" maxlength="40" value="${esc(it.item)}"
+          placeholder="${it.kind === "drink" ? "Which drink? e.g. Coke" : "What do you need?"}">
+        <div class="stepper"><button data-act="reqQty" data-i="${i}" data-d="-1">−</button><span>${it.qty}</span><button data-act="reqQty" data-i="${i}" data-d="1">+</button></div>
+        <button class="iconbtn" data-act="reqDel" data-i="${i}" aria-label="Remove">✕</button>
+      </div>
+      <input class="field note-in" id="req-note-${i}" data-req="${i}" data-f="note" maxlength="80" value="${esc(it.note || "")}" placeholder="Note (optional), e.g. size 43">
+    </div>`).join("") : `<div class="empty-state">Tap an item above to add it.</div>`}
+    <button class="btn primary" data-act="reqSave" ${S.busy ? "disabled" : ""}>Save my list</button>`;
+}
+function bringRedraw() { S.sheet.redraw = true; renderOverlay(); }
+async function saveBring() {
+  const items = S.sheet.items
+    .map((i) => ({ item: i.item.trim().slice(0, 40), qty: Math.min(20, Math.max(1, i.qty | 0)), note: (i.note || "").trim().slice(0, 80), kind: i.kind || "item" }))
+    .filter((i) => i.item);
+  await busy(async () => {
+    await setDoc(doc(db, "requests", S.uid), { items, updatedAt: serverTimestamp() });
+    S.sheet = null;
+    toast(items.length ? "List saved 🧃" : "List cleared");
+  });
+}
+
+/* ---------- suggestions + dares ---------- */
+function openDaresForMe() { return S.dares.filter((d) => d.to === S.uid && d.status === "open"); }
+function dareTextOf(id) {
+  if (!(id in S.dareText)) {
+    S.dareText[id] = null;
+    getDoc(doc(db, "dareText", id)).then((s) => { S.dareText[id] = s.exists() ? s.data() : { title: "(hidden)", details: "" }; render(); }).catch(() => {});
+  }
+  return S.dareText[id];
+}
+function daresSection() {
+  const forMe = S.dares.filter((d) => d.to === S.uid);
+  const sent = S.dares.filter((d) => d.from === S.uid);
+  if (!forMe.length && !sent.length) return "";
+  const pts = S.config?.points?.dare ?? 10;
+  const card = (d) => {
+    const t = dareTextOf(d.id);
+    return `<div class="card dare ${d.status !== "open" ? "closed" : ""}">
+      <div class="from">🎲 Dare from ${esc(nameOf(d.from))} · ${pts} pts</div>
+      <div class="title">${esc(t?.title || "Loading…")}</div>
+      ${t?.details ? `<div class="blurb">${esc(t.details)}</div>` : ""}
+      ${d.status === "open" ? `<div class="row" style="margin-top:12px">
+        <button class="btn primary small" data-act="dareDone" data-id="${d.id}">✓ Done</button>
+        <button class="btn small" data-act="dareSkip" data-id="${d.id}">Skip</button></div>`
+        : `<div class="foot"><span class="state ${d.status === "done" ? "done" : ""}">${d.status === "done" ? "Completed" : "Skipped"}</span>
+           <button class="btn ghost small" data-act="dareReopen" data-id="${d.id}">Undo</button></div>`}
+    </div>`;
+  };
+  return `${forMe.length ? `<h2>Dares for you</h2><p class="sub" style="margin:-4px 0 10px;font-size:13px">Skipping is always fine. No penalty.</p>${forMe.map(card).join("")}` : ""}
+    ${sent.length ? `<h2>Dares you sent</h2><div class="list">${sent.map((d) => `<div class="hrow"><div class="grow"><b>${esc(dareTextOf(d.id)?.title || "…")}</b><small>to ${esc(nameOf(d.to))} · ${d.status}</small></div></div>`).join("")}</div>` : ""}`;
+}
+async function setDare(id, status) {
+  try { await updateDoc(doc(db, "dares", id), { status, completedAt: status === "done" ? serverTimestamp() : null }); }
+  catch (e) { toast(friendly(e)); }
+}
+
+function suggestSheet() {
+  const t = S.sheet.target || "anyone";
+  const seg = (id, label) => `<button type="button" class="${t === id ? "on" : ""}" data-act="sgTarget" data-id="${id}">${label}</button>`;
+  const others = [...S.players.entries()].filter(([u]) => u !== S.uid).sort((a, b) => a[1].name.localeCompare(b[1].name));
+  const pts = { ...{ easy: 10, dare: 10, suggestBonus: 5, hostQuestReward: 10 }, ...(S.config?.points || {}) };
+  const sizes = t === "team" ? [2, 3, 4, 5, 6] : [1, 2, 3, 4, 5, 6];
+  const hint = {
+    anyone: `Goes on the bonus board for anyone to take. They get ${pts.easy} pts, you get +${pts.suggestBonus} when it's done.`,
+    team: `Goes on the bonus board with you already in. Others join to fill it.`,
+    player: `Only they (and admin) see it. They get ${pts.dare} pts if they do it, you get +${pts.suggestBonus}. They can skip it.`,
+    admin: `For Shalom. If Shalom does it, you get ${pts.hostQuestReward} pts.`,
+  }[t];
+  return `<h3>Suggest a sidequest</h3>
+    <div class="seg four">${seg("anyone", "Anyone")}${seg("team", "Me + others")}${seg("player", "A player")}${seg("admin", "Admin")}</div>
+    <p class="sub" style="font-size:14px">${hint}</p>
+    ${t === "player" ? `<select class="field" id="sgTo"><option value="">Who's it for?</option>${others.map(([u, p]) => `<option value="${u}">${esc(p.name)}</option>`).join("")}</select>` : ""}
+    <input class="field" id="sgTitle" maxlength="40" placeholder="Quest name, e.g. Human Beatbox">
+    <textarea class="field" id="sgDetails" maxlength="300" placeholder="What do they have to do? What counts as done?"></textarea>
+    ${t === "anyone" || t === "team" ? `<select class="field" id="sgSize">${sizes.map((n) => `<option value="${n}">${n === 1 ? "Solo (1 player)" : `${n} players`}</option>`).join("")}</select>` : ""}
+    ${t === "admin" ? `<label class="check"><input type="checkbox" id="anon"> Send anonymously (no points)</label>` : ""}
+    ${t !== "admin" ? `<div class="caution">⚠️ This goes live straight away. Keep it kind, safe and consensual: no pressuring strangers, no touching without a yes, nothing that could get anyone hurt. Admin can remove anything.</div>` : ""}
+    <button class="btn pink" data-act="sgSend" ${S.busy ? "disabled" : ""}>${t === "admin" ? "Send to Shalom" : "Publish it"}</button>`;
+}
+
+async function sendSuggestion() {
+  const t = S.sheet.target || "anyone";
+  const title = document.getElementById("sgTitle").value.trim();
+  const details = document.getElementById("sgDetails").value.trim();
+  if (title.length < 2) return toast("Give it a name.");
+  await busy(async () => {
+    if (t === "admin") {
+      const anon = document.getElementById("anon").checked;
+      await addDoc(collection(db, "inbox"), {
+        fromUid: anon ? null : S.uid, fromName: anon ? null : S.me.name,
+        text: (details ? `${title}: ${details}` : title).slice(0, 500), createdAt: serverTimestamp(), status: "new",
+      });
+      toast("Sent to Shalom 📨");
+    } else if (t === "player") {
+      const to = document.getElementById("sgTo").value;
+      if (!to) throw new Error("Pick who it's for.");
+      const id = "d" + newKey();
+      const b = writeBatch(db);
+      b.set(doc(db, "dareText", id), { title, details });
+      b.set(doc(db, "dares", id), { from: S.uid, to, status: "open", createdAt: serverTimestamp(), completedAt: null });
+      await b.commit();
+      toast(`Dare sent to ${nameOf(to)} 🎲`);
+    } else {
+      const n = Number(document.getElementById("sgSize").value) || 1;
+      await setDoc(doc(db, "quests", "s-" + newKey()), {
+        title, blurb: details, type: n === 1 ? "personal" : "group", pool: "bonus", level: "easy", category: "suggested",
+        min: n, max: n, instructions: [], doneWhen: "You all agree it happened. Be honest!",
+        twistCount: 0, needsHostSetup: false, order: 10000 + S.quests.length, active: true,
+        members: t === "team" ? [S.uid] : [], twistDone: [], status: "open", note: "", completedBy: null, completedAt: null,
+        suggestedBy: S.uid,
+      });
+      toast("Published to the bonus board 💡");
+    }
+    S.sheet = null;
+  });
+}
+
 /* ---------- events ---------- */
 document.addEventListener("click", (e) => {
   const t = e.target.closest("[data-act]");
   if (!t) return;
   const act = t.dataset.act;
   const qid = S.sheet?.id;
-  if (act === "tab") { S.tab = t.dataset.id; S.sheet = null; render(); window.scrollTo(0, 0); }
+  if (act === "tab") { if (S.sheet?.kind === "chat") closeChat(); S.tab = t.dataset.id; S.sheet = null; render(); window.scrollTo(0, 0); }
   else if (act === "board") { S.board = t.dataset.id; render(); }
   else if (act === "open") { S.sheet = { kind: "quest", id: t.dataset.id }; renderOverlay(); }
-  else if (act === "close") { S.sheet = null; renderOverlay(); }
+  else if (act === "close") { if (S.sheet?.kind === "chat") { closeChat(); S.sheet = null; render(); } else { S.sheet = null; renderOverlay(); } }
   else if (act === "inbox") { S.sheet = { kind: "inbox" }; renderOverlay(); }
   else if (act === "rules") { S.sheet = { kind: "rules" }; renderOverlay(); }
+  else if (act === "suggest") { S.sheet = { kind: "suggest", target: "anyone" }; renderOverlay(); }
+  else if (act === "sgTarget") { S.sheet.target = t.dataset.id; renderOverlay(); }
+  else if (act === "sgSend") sendSuggestion();
+  else if (act === "dareDone") setDare(t.dataset.id, "done");
+  else if (act === "dareSkip") setDare(t.dataset.id, "skipped");
+  else if (act === "dareReopen") setDare(t.dataset.id, "open");
+  else if (act === "bring") openBring();
+  else if (act === "reqAdd") {
+    const items = S.sheet.items;
+    const name = t.dataset.item;
+    const existing = name && items.find((i) => i.item.toLowerCase() === name.toLowerCase());
+    if (existing) existing.qty = Math.min(20, existing.qty + 1);
+    else items.push({ item: name || "", qty: 1, note: "", kind: t.dataset.kind || "item" });
+    bringRedraw();
+    if (!name) setTimeout(() => document.getElementById(`req-item-${items.length - 1}`)?.focus(), 30);
+  }
+  else if (act === "reqQty") { const it = S.sheet.items[t.dataset.i]; it.qty = Math.min(20, Math.max(1, it.qty + Number(t.dataset.d))); bringRedraw(); }
+  else if (act === "reqDel") { S.sheet.items.splice(Number(t.dataset.i), 1); bringRedraw(); }
+  else if (act === "reqSave") saveBring();
+  else if (act === "chat") openChat(t.dataset.id);
+  else if (act === "dm") openChat(dmChatId(S.uid, t.dataset.uid));
+  else if (act === "pickPlayer") { S.sheet = { kind: "pickPlayer" }; renderOverlay(); }
   else if (act === "reveal") { t.classList.toggle("shown"); S.revealed[t.classList.contains("shown") ? "add" : "delete"](qid); }
   else if (act === "join") join(qid);
   else if (act === "leave") leave(qid);
@@ -507,12 +821,17 @@ document.addEventListener("click", (e) => {
   else if (act === "gateMode") { S.gateMode = t.dataset.id; S.regError = ""; render(); }
   else if (act === "cancelClaim") deleteDoc(doc(db, "claims", S.uid)).catch((er) => toast(friendly(er)));
 });
+document.addEventListener("input", (e) => {
+  const i = e.target.dataset.req;
+  if (i !== undefined && S.sheet?.kind === "bring") S.sheet.items[i][e.target.dataset.f] = e.target.value;
+});
 document.addEventListener("change", (e) => {
   if (e.target.dataset.act === "twist") toggleTwist(S.sheet.id, e.target.checked);
 });
 document.addEventListener("submit", (e) => {
   const act = e.target.dataset.act;
-  if (["register", "login", "setPin"].includes(act)) e.preventDefault();
+  if (["register", "login", "setPin", "sendMsg"].includes(act)) e.preventDefault();
+  if (act === "sendMsg") sendMsg();
   if (act === "register") register();
   if (act === "login") login();
   if (act === "setPin") setPin();

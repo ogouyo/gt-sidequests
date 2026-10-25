@@ -14,6 +14,8 @@ service cloud.firestore {
     function changedOnly(keys) { return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys); }
     function symDiff(a, b) { return a.toSet().difference(b.toSet()).union(b.toSet().difference(a.toSet())); }
     function validName(n) { return n is string && n.size() >= 2 && n.size() <= 20; }
+    function isPlayer() { return signedIn() && exists(/databases/$(database)/documents/players/$(me())); }
+    function str(v, lo, hi) { return v is string && v.size() >= lo && v.size() <= hi; }
 
     match /config/{id} {
       allow read: if signedIn();
@@ -72,8 +74,27 @@ service cloud.firestore {
 
     match /quests/{qid} {
       allow read: if signedIn();
-      allow create, delete: if isHost();
+      allow create: if isHost() || suggestQuest();
+      allow delete: if isHost();
       allow update: if isHost() || joinQuest() || leaveQuest() || setStatus() || toggleTwist();
+
+      // Players can publish their own (easy, bonus) quest ideas straight to the board.
+      function suggestQuest() {
+        let n = request.resource.data;
+        return isPlayer()
+          && n.keys().hasOnly(['title', 'blurb', 'type', 'pool', 'level', 'category', 'min', 'max', 'instructions', 'doneWhen',
+                               'twistCount', 'needsHostSetup', 'order', 'active', 'members', 'twistDone', 'status', 'note',
+                               'completedBy', 'completedAt', 'suggestedBy'])
+          && n.suggestedBy == me()
+          && str(n.title, 2, 40) && str(n.blurb, 0, 300) && str(n.doneWhen, 0, 200)
+          && n.instructions is list && n.instructions.size() <= 3
+          && n.pool == 'bonus' && n.level == 'easy' && n.active == true
+          && n.min is int && n.min >= 1 && n.max == n.min && n.max <= 6
+          && n.type == (n.max == 1 ? 'personal' : 'group')
+          && n.twistCount == 0 && n.twistDone == [] && n.needsHostSetup == false
+          && n.status == 'open' && n.note == '' && n.completedBy == null && n.completedAt == null
+          && (n.members == [] || n.members == [me()]);
+      }
 
       // Players may only add themselves, at the end of the list, while there is room.
       function joinQuest() {
@@ -114,6 +135,79 @@ service cloud.firestore {
           && changedOnly(['twistDone'])
           && symDiff(n.twistDone, o.twistDone) == [me()].toSet();
       }
+    }
+
+    // Chats. "q_<questId>": the quest's team. "d_<uidA>_<uidB>": two players. The host can read everything.
+    function canChat(chatId) {
+      let p = chatId.split('_');
+      return signedIn() && (
+        (chatId == 'all' && isPlayer())
+        || (p.size() == 2 && p[0] == 'q' && me() in get(/databases/$(database)/documents/quests/$(p[1])).data.members)
+        || (p.size() == 3 && p[0] == 'd' && p[1] != p[2] && (me() == p[1] || me() == p[2]))
+      );
+    }
+    function chatMetaOk(chatId) {
+      let p = chatId.split('_');
+      let d = request.resource.data;
+      return d.keys().hasOnly(['members', 'lastAt', 'lastFrom', 'lastText'])
+        && d.lastFrom == me() && d.lastAt == request.time
+        && d.lastText is string && d.lastText.size() <= 80
+        && (chatId == 'all' || p[0] == 'q' || d.members == [p[1], p[2]]);
+    }
+    match /chats/{chatId} {
+      allow get: if isHost() || canChat(chatId);
+      allow list: if isHost() || (signedIn() && me() in resource.data.members);
+      allow create, update: if isHost() || (canChat(chatId) && chatMetaOk(chatId));
+      allow delete: if isHost();
+    }
+    match /chats/{chatId}/messages/{mid} {
+      allow read: if isHost() || canChat(chatId);
+      allow create: if canChat(chatId)
+        && request.resource.data.keys().hasOnly(['from', 'text', 'at'])
+        && request.resource.data.from == me()
+        && request.resource.data.text is string
+        && request.resource.data.text.size() >= 1 && request.resource.data.text.size() <= 500
+        && request.resource.data.at == request.time;
+      // The host posts as "admin".
+      allow create: if isHost() && request.resource.data.from == 'admin'
+        && str(request.resource.data.text, 1, 500) && request.resource.data.at == request.time;
+      allow delete: if isHost();
+    }
+
+    // Bring list: one doc per player, open until the deadline the host sets.
+    match /requests/{uid} {
+      allow read: if isHost() || (signedIn() && me() == uid);
+      allow create, update: if isPlayer() && me() == uid
+        && request.time < cfg().requestDeadline
+        && request.resource.data.keys().hasOnly(['items', 'updatedAt'])
+        && request.resource.data.items is list && request.resource.data.items.size() <= 25
+        && request.resource.data.updatedAt == request.time;
+      allow delete: if isHost();
+    }
+
+    // Dares: one player sets a sidequest for another. Who/status is public (for points); the text is private.
+    match /dares/{id} {
+      allow read: if signedIn();
+      allow create: if isPlayer()
+        && request.resource.data.keys().hasOnly(['from', 'to', 'status', 'createdAt', 'completedAt'])
+        && request.resource.data.from == me() && request.resource.data.to != me()
+        && exists(/databases/$(database)/documents/players/$(request.resource.data.to))
+        && request.resource.data.status == 'open' && request.resource.data.completedAt == null
+        && request.resource.data.createdAt == request.time
+        && existsAfter(/databases/$(database)/documents/dareText/$(id));
+      allow update: if signedIn() && resource.data.to == me()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'completedAt'])
+        && request.resource.data.status in ['open', 'done', 'skipped'];
+      allow delete: if isHost();
+    }
+    match /dareText/{id} {
+      allow read: if isHost() || (signedIn()
+        && me() in [get(/databases/$(database)/documents/dares/$(id)).data.to, get(/databases/$(database)/documents/dares/$(id)).data.from]);
+      allow create: if isPlayer()
+        && getAfter(/databases/$(database)/documents/dares/$(id)).data.from == me()
+        && request.resource.data.keys().hasOnly(['title', 'details'])
+        && str(request.resource.data.title, 2, 40) && str(request.resource.data.details, 0, 300);
+      allow delete: if isHost();
     }
 
     // Secret twists: slot i belongs to the i-th member to join. A quest with one twist shares it.
