@@ -210,6 +210,22 @@ service cloud.firestore {
       allow delete: if isHost();
     }
 
+    // Usage stats: each visit writes its own session doc. Only the host can read them.
+    match /sessions/{sid} {
+      allow read, delete: if isHost();
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['uid', 'device', 'deviceLabel', 'startedAt', 'lastSeenAt', 'activeSec', 'questOpens', 'views'])
+        && request.resource.data.uid == me()
+        && request.resource.data.activeSec == 0
+        && request.resource.data.startedAt == request.time && request.resource.data.lastSeenAt == request.time
+        && str(request.resource.data.device, 1, 40) && str(request.resource.data.deviceLabel, 1, 40);
+      allow update: if signedIn() && resource.data.uid == me()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lastSeenAt', 'activeSec', 'questOpens', 'views'])
+        && request.resource.data.lastSeenAt == request.time
+        && request.resource.data.activeSec is int && request.resource.data.activeSec <= 86400
+        && request.resource.data.questOpens.size() <= 100 && request.resource.data.views.size() <= 20;
+    }
+
     // Secret twists: slot i belongs to the i-th member to join. A quest with one twist shares it.
     match /questSecrets/{qid}/slots/{slot} {
       allow read: if isHost() || canSeeSlot(qid, slot);

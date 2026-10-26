@@ -4,7 +4,7 @@ import {
   query, orderBy, limitToLast,
 } from "./firebase.js";
 import { ms, messagesHtml, keepScroll, GROUP_CHAT } from "./chat.js";
-import { esc, sizeLabel, questState, slotText, myQuests, coreProgress, computeScores, slotMath, filterSort } from "./game.js";
+import { esc, sizeLabel, questState, slotText, myQuests, coreProgress, computeScores, slotMath, filterSort, needsSetup } from "./game.js";
 
 const { auth, db } = makeApp("host", { offline: false });
 
@@ -12,7 +12,7 @@ const S = {
   user: undefined, config: null, quests: [], players: new Map(), claims: [], inbox: [],
   tab: "overview", qfilter: "group", sheet: null, busy: false, listening: false,
   hview: { sort: "order", level: "all", space: false, size: "any" }, importMode: "full",
-  chats: [], msgs: [], requests: [], dares: [], dareText: {}, shopping: {}, defaulted: false,
+  chats: [], msgs: [], sessions: [], requests: [], dares: [], dareText: {}, shopping: {}, defaulted: false,
 };
 // Default bring-list deadline: Thursday 29 October 2026, 11:59pm Lagos time.
 const DEFAULT_DEADLINE = new Date("2026-10-29T23:59:00+01:00");
@@ -64,6 +64,7 @@ function listen() {
     render();
   });
   onSnapshot(doc(db, "config", "shopping"), (s) => { S.shopping = s.exists() ? s.data().checked || {} : {}; render(); });
+  onSnapshot(collection(db, "sessions"), (snap) => { S.sessions = snap.docs.map((d) => ({ id: d.id, ...d.data() })); render(); }, () => {});
   onSnapshot(collection(db, "requests"), (snap) => { S.requests = snap.docs.map((d) => ({ uid: d.id, ...d.data() })); render(); });
   onSnapshot(collection(db, "dares"), (snap) => { S.dares = snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => ms(b.createdAt) - ms(a.createdAt)); render(); });
   onSnapshot(collection(db, "dareText"), (snap) => { S.dareText = Object.fromEntries(snap.docs.map((d) => [d.id, d.data()])); render(); });
@@ -108,6 +109,7 @@ function render() {
   else if (S.tab === "inbox") body = viewInbox();
   else if (S.tab === "chats") body = viewChats();
   else if (S.tab === "bring") body = viewBring();
+  else if (S.tab === "stats") body = viewStats();
   // Keep the edit form's typed values when live data re-renders.
   const keep = {};
   $overlay.querySelectorAll("[name]").forEach((el) => (keep[el.name] = el.value));
@@ -122,7 +124,7 @@ function render() {
       <button class="btn small ghost" data-act="logout">Sign out</button>
     </div></header>
     <main><div class="wrap">
-      <div class="seg">${t("overview", "Overview")}${t("quests", "Quests")}${t("players", `Players (${S.players.size})`)}${t("chats", "Chats")}${t("bring", "Bring list")}${t("inbox", `Inbox${newInbox ? ` (${newInbox})` : ""}`)}</div>
+      <div class="seg">${t("overview", "Overview")}${t("quests", "Quests")}${t("players", `Players (${S.players.size})`)}${t("stats", "Stats")}${t("chats", "Chats")}${t("bring", "Bring list")}${t("inbox", `Inbox${newInbox ? ` (${newInbox})` : ""}`)}</div>
       ${body}
     </div></main>`;
   renderOverlay();
@@ -182,8 +184,9 @@ function viewOverview() {
     <button class="btn primary" data-act="saveRules">Save house rules</button>
 
     <h2>Data</h2>
-    <div class="row"><button class="btn" data-act="importAdd">＋ Add new quests from file</button><button class="btn" data-act="exportQuests">⬇ Download quests.json</button></div>
-    <p class="sub" style="font-size:13px">"Add new quests" only adds quests you don't already have (matched by name), so your edits are safe. "Download" saves your live quests, twists and settings as a backup.</p>
+    <div class="row"><button class="btn" data-act="importAdd">＋ Add new quests from file</button><button class="btn" data-act="importText">✏️ Update descriptions from file</button></div>
+    <div class="row" style="margin-top:8px"><button class="btn" data-act="exportQuests">⬇ Download quests.json</button></div>
+    <p class="sub" style="font-size:13px">"Add new" only adds quests you don't already have. "Update descriptions" only changes wording (hook, steps, done when, tips). "Download" saves your live quests as a backup.</p>
     <div class="row" style="margin-top:8px"><button class="btn danger" data-act="import">Replace all quest text from file</button></div>
     <div class="row" style="margin-top:8px"><button class="btn danger" data-act="resetProgress">Reset all progress</button><button class="btn danger" data-act="resetAll">Remove all players</button></div>
     <p class="sub" style="font-size:13px">Use the reset buttons after testing, before you share the link.</p>`;
@@ -279,6 +282,103 @@ async function hostSend() {
   b.set(doc(collection(db, "chats", GROUP_CHAT, "messages")), { from: "admin", text, at: serverTimestamp() });
   b.set(doc(db, "chats", GROUP_CHAT), { lastAt: serverTimestamp(), lastFrom: "admin", lastText: text.slice(0, 80) });
   await b.commit();
+}
+
+/* ---------- stats ---------- */
+const dur = (sec) => {
+  sec = Math.round(sec || 0);
+  if (sec < 60) return `${sec}s`;
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60);
+  return h ? `${h}h ${m}m` : `${m}m ${sec % 60 ? `${sec % 60}s` : ""}`.trim();
+};
+const dayKey = (t) => { const d = new Date(ms(t)); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; };
+const dayLabel = (k) => new Date(k + "T12:00:00").toLocaleDateString([], { weekday: "short", day: "numeric", month: "short" });
+const ago = (t) => { const m = Math.round((Date.now() - ms(t)) / 60000); return m < 1 ? "just now" : m < 60 ? `${m} min ago` : m < 1440 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} d ago`; };
+const who = (uid) => (S.players.has(uid) ? S.players.get(uid).name : "Not signed in");
+
+function viewStats() {
+  const ss = S.sessions.filter((x) => x.startedAt);
+  if (!ss.length) return `<div class="empty-state">No visits recorded yet. Stats start filling in as people open the app.</div>`;
+  const today = dayKey({ seconds: Date.now() / 1000 });
+  const timed = ss.filter((x) => (x.activeSec || 0) > 0);
+  const avg = timed.length ? timed.reduce((a, x) => a + x.activeSec, 0) / timed.length : 0;
+  const todays = ss.filter((x) => dayKey(x.startedAt) === today);
+
+  // Visits per day
+  const days = new Map();
+  for (const x of ss) {
+    const k = dayKey(x.startedAt);
+    if (!days.has(k)) days.set(k, { visits: 0, people: new Set(), sec: 0 });
+    const d = days.get(k); d.visits++; d.people.add(x.uid); d.sec += x.activeSec || 0;
+  }
+  const dayRows = [...days.entries()].sort((a, b) => b[0].localeCompare(a[0]));
+  const maxV = Math.max(...dayRows.map(([, d]) => d.visits));
+
+  // Per player (by account) and per device
+  const people = new Map(), devices = new Map();
+  for (const x of ss) {
+    const key = S.players.has(x.uid) ? x.uid : "anon";
+    if (!people.has(key)) people.set(key, { visits: 0, sec: 0, devices: new Set(), last: 0, opens: 0 });
+    const p = people.get(key);
+    p.visits++; p.sec += x.activeSec || 0; p.devices.add(x.device); p.last = Math.max(p.last, ms(x.lastSeenAt));
+    p.opens += Object.values(x.questOpens || {}).reduce((a, n) => a + n, 0);
+    if (!devices.has(x.device)) devices.set(x.device, { label: x.deviceLabel, visits: 0, sec: 0, users: new Set() });
+    const dv = devices.get(x.device); dv.visits++; dv.sec += x.activeSec || 0; if (S.players.has(x.uid)) dv.users.add(x.uid);
+  }
+  const peopleRows = [...people.entries()].sort((a, b) => b[1].visits - a[1].visits);
+  const devRows = [...devices.values()].sort((a, b) => b.visits - a.visits);
+
+  // Quest opens
+  const opens = new Map();
+  for (const x of ss) for (const [qid, n] of Object.entries(x.questOpens || {})) {
+    if (!opens.has(qid)) opens.set(qid, { n: 0, who: new Set() });
+    const o = opens.get(qid); o.n += n; o.who.add(x.uid);
+  }
+  const questRows = S.quests.map((q) => ({ q, o: opens.get(q.id) || { n: 0, who: new Set() } })).sort((a, b) => b.o.n - a.o.n);
+  const tabs = {};
+  for (const x of ss) for (const [k, n] of Object.entries(x.views || {})) tabs[k] = (tabs[k] || 0) + n;
+  const tabNames = { mine: "My quests", board: "Board", chats: "Chats", ranks: "Ranks" };
+
+  return `
+    <div class="stats">
+      <div class="stat"><div class="big">${todays.length}</div><small>visits today</small></div>
+      <div class="stat"><div class="big">${new Set(todays.map((x) => x.uid)).size}</div><small>people today</small></div>
+      <div class="stat"><div class="big">${dur(avg)}</div><small>average visit</small></div>
+      <div class="stat"><div class="big">${ss.length}</div><small>visits in total</small></div>
+    </div>
+
+    <h2>Visits per day</h2>
+    <div class="list">${dayRows.map(([k, d]) => `<div class="hrow"><div class="grow"><b>${dayLabel(k)}</b>
+      <div class="bar"><i style="width:${Math.max(4, Math.round((d.visits / maxV) * 100))}%"></i></div>
+      <small>${d.visits} visits · ${d.people.size} people · ${dur(d.sec)} in total</small></div></div>`).join("")}</div>
+
+    <h2>Per player</h2>
+    <div class="list">${peopleRows.map(([k, p]) => `<div class="hrow"><div class="grow"><b>${esc(k === "anon" ? "Not signed in yet" : who(k))}</b>
+      <small>${p.visits} visits · ${dur(p.sec)} in the app · avg ${dur(p.sec / p.visits)} · ${p.devices.size} device${p.devices.size > 1 ? "s" : ""} · ${p.opens} quest opens</small>
+      <small>Last seen ${p.last ? ago({ seconds: p.last / 1000 }) : "?"}</small></div></div>`).join("")}</div>
+
+    <h2>Per device</h2>
+    <div class="list">${devRows.map((d) => `<div class="hrow"><div class="grow"><b>${esc(d.label || "Unknown")}</b>
+      <small>${d.visits} visits · ${dur(d.sec)} · used by ${[...d.users].map(who).map(esc).join(", ") || "nobody signed in"}</small></div></div>`).join("")}</div>
+
+    <h2>Quests opened</h2>
+    <div class="list">${questRows.filter(({ o }) => o.n).map(({ q, o }) => `<div class="hrow"><div class="grow"><b>${esc(q.title)}</b>
+      <small>${o.n} opens by ${o.who.size} ${o.who.size === 1 ? "person" : "people"} · ${q.members.length} joined${q.status === "done" ? " · done" : ""}</small></div></div>`).join("") || `<div class="hrow"><small>No quests opened yet.</small></div>`}</div>
+    ${questRows.some(({ o }) => !o.n) ? `<p class="sub" style="font-size:13px;margin-top:8px">Not opened yet: ${questRows.filter(({ o }) => !o.n).map(({ q }) => esc(q.title)).join(", ")}</p>` : ""}
+
+    <h2>Tabs viewed</h2>
+    <div class="list">${Object.entries(tabs).sort((a, b) => b[1] - a[1]).map(([k, n]) => `<div class="hrow"><div class="grow">${esc(tabNames[k] || k)}</div><b>${n}</b></div>`).join("") || `<div class="hrow"><small>No tab switches yet.</small></div>`}</div>
+
+    <button class="btn danger small" data-act="clearStats" style="margin-top:16px">Clear stats</button>
+    <p class="sub" style="font-size:13px">"Time" counts only while the app is open on screen. A new visit starts when someone opens the app, logs in, or comes back after 30+ minutes.</p>`;
+}
+
+async function clearStats(confirmFirst = true) {
+  if (confirmFirst && !confirm("Delete all recorded visits and stats?")) return;
+  for (let i = 0; i < S.sessions.length; i += 400) {
+    const b = writeBatch(db); S.sessions.slice(i, i + 400).forEach((x) => b.delete(doc(db, "sessions", x.id))); await b.commit();
+  }
+  toast("Stats cleared");
 }
 
 /* ---------- bring list ---------- */
@@ -380,6 +480,8 @@ function renderOverlayInner() {
       <div class="label sub">How to play (one step per line)</div>
       <textarea class="field" name="instructions">${esc((q.instructions || []).join("\n"))}</textarea>
       <input class="field" name="doneWhen" placeholder="Done when…" value="${esc(q.doneWhen)}">
+      <div class="label sub">💡 Tips (one per line, optional)</div>
+      <textarea class="field" name="tips">${esc((q.tips || []).join("\n"))}</textarea>
       <div class="label sub">Secret twists, one per line. Line 1 goes to the first person who joins, line 2 to the second, and so on. A single line is shared by the whole team.</div>
       <textarea class="field" name="twists" placeholder="${S.sheet.loading ? "Loading…" : "Optional"}">${esc((S.sheet.twists || []).join("\n"))}</textarea>
       <button class="btn primary" data-act="saveQuest">Save</button>
@@ -406,7 +508,8 @@ async function saveQuest() {
   const content = {
     title: v.title.trim(), blurb: v.blurb.trim(), type: v.type, pool: v.pool, level: v.level, category: v.category.trim(),
     min, max, instructions: v.instructions.split("\n").map((s) => s.trim()).filter(Boolean), doneWhen: v.doneWhen.trim(),
-    twistCount: twists.length, needsHostSetup: twists.some((t) => t.includes("[HOST")),
+    tips: v.tips.split("\n").map((s) => s.trim()).filter(Boolean),
+    twistCount: twists.length, needsHostSetup: needsSetup(twists),
   };
   const old = S.sheet.q;
   const id = S.sheet.isNew ? slug(content.title) : old.id;
@@ -430,6 +533,7 @@ async function importFile(file) {
   const data = JSON.parse(await file.text());
   if (!Array.isArray(data.quests)) throw new Error("That file has no quests list.");
   if (S.importMode === "add" && S.quests.length) return importAdd(data);
+  if (S.importMode === "text" && S.quests.length) return importText(data);
   if (S.quests.length && !confirm("Re-importing overwrites quest text and twists (including your edits). Who joined what is kept. Continue?")) return;
   const b = writeBatch(db);
   b.set(doc(db, "config", "game"), {
@@ -440,8 +544,8 @@ async function importFile(file) {
     const twists = q.twists || [];
     const content = {
       title: q.title, blurb: q.blurb || "", type: q.type, pool: q.pool, level: q.level, category: q.category || "",
-      min: q.min, max: q.max, instructions: q.instructions || [], doneWhen: q.doneWhen || "",
-      twistCount: twists.length, needsHostSetup: twists.some((t) => t.includes("[HOST")), order: i,
+      min: q.min, max: q.max, instructions: q.instructions || [], doneWhen: q.doneWhen || "", tips: q.tips || [],
+      twistCount: twists.length, needsHostSetup: needsSetup(twists), order: i,
     };
     const existing = qById(q.id);
     if (existing) b.update(doc(db, "quests", q.id), content);
@@ -465,13 +569,29 @@ async function importAdd(data) {
     b.set(doc(db, "quests", q.id), {
       ...blankState(), active: true, order: order++,
       title: q.title, blurb: q.blurb || "", type: q.type, pool: q.pool, level: q.level, category: q.category || "",
-      min: q.min, max: q.max, instructions: q.instructions || [], doneWhen: q.doneWhen || "",
-      twistCount: twists.length, needsHostSetup: twists.some((t) => t.includes("[HOST")),
+      min: q.min, max: q.max, instructions: q.instructions || [], doneWhen: q.doneWhen || "", tips: q.tips || [],
+      twistCount: twists.length, needsHostSetup: needsSetup(twists),
     });
     writeSlots(b, q.id, twists, 0);
   }
   await b.commit();
   toast(`Added ${fresh.length} quests`);
+}
+
+// Update only the wording (hook, steps, done when, tips) of quests you already have. Matched by id, then by title.
+async function importText(data) {
+  const byTitle = new Map(S.quests.map((q) => [q.title.trim().toLowerCase(), q]));
+  const pairs = data.quests.map((f) => [f, qById(f.id) || byTitle.get(String(f.title).trim().toLowerCase())]).filter(([, q]) => q && !q.suggestedBy);
+  if (!pairs.length) return toast("No matching quests in that file.");
+  if (!confirm(`Update the wording of ${pairs.length} quests? Difficulty, team size, twists and who's joined stay as they are.`)) return;
+  const b = writeBatch(db);
+  for (const [f, q] of pairs) {
+    const upd = { blurb: f.blurb || "", instructions: f.instructions || [], doneWhen: f.doneWhen || "", tips: f.tips || [] };
+    if (f.twists) upd.needsHostSetup = needsSetup(f.twists);
+    b.update(doc(db, "quests", q.id), upd);
+  }
+  await b.commit();
+  toast(`Updated ${pairs.length} quests`);
 }
 
 async function exportQuests() {
@@ -480,7 +600,7 @@ async function exportQuests() {
     const snaps = await Promise.all(Array.from({ length: q.twistCount || 0 }, (_, i) => getDoc(doc(db, "questSecrets", q.id, "slots", String(i)))));
     quests.push({
       id: q.id, title: q.title, type: q.type, pool: q.pool, min: q.min, max: q.max, level: q.level, category: q.category || "",
-      blurb: q.blurb || "", instructions: q.instructions || [], doneWhen: q.doneWhen || "",
+      blurb: q.blurb || "", instructions: q.instructions || [], doneWhen: q.doneWhen || "", tips: q.tips || [],
       twists: snaps.map((s) => (s.exists() ? s.data().text : "")),
     });
   }
@@ -538,7 +658,7 @@ async function resetProgress() {
 }
 
 async function resetAll() {
-  if (!confirm("Remove ALL players, their names, the inbox, chats, bring requests, dares and player-made quests, and clear quest progress?")) return;
+  if (!confirm("Remove ALL players, their names, the inbox, chats, bring requests, dares, player-made quests and stats, and clear quest progress?")) return;
   const b = writeBatch(db);
   S.quests.forEach((q) => b.update(doc(db, "quests", q.id), blankState()));
   S.players.forEach((p, uid) => b.delete(doc(db, "players", uid)));
@@ -552,6 +672,7 @@ async function resetAll() {
   S.dares.forEach((d) => { refs.push(doc(db, "dares", d.id)); refs.push(doc(db, "dareText", d.id)); });
   S.quests.filter((q) => q.suggestedBy).forEach((q) => refs.push(doc(db, "quests", q.id)));
   refs.push(doc(db, "config", "shopping"));
+  S.sessions.forEach((x) => refs.push(doc(db, "sessions", x.id)));
   for (const c of S.chats) {
     (await getDocs(collection(db, "chats", c.id, "messages"))).forEach((d) => refs.push(d.ref));
     refs.push(doc(db, "chats", c.id));
@@ -578,11 +699,13 @@ document.addEventListener("click", (e) => {
     copy: () => navigator.clipboard.writeText(playerLink()).then(() => toast("Link copied")),
     import: () => { S.importMode = "full"; document.getElementById("importFile").click(); },
     importAdd: () => { S.importMode = "add"; document.getElementById("importFile").click(); },
+    importText: () => { S.importMode = "text"; document.getElementById("importFile").click(); },
     exportQuests: () => run(exportQuests),
     edit: () => run(() => openEdit(id)),
     newQuest: () => { S.sheet = { isNew: true, twists: [], q: { title: "", blurb: "", type: "group", pool: "bonus", level: "easy", category: "", min: 2, max: 2, instructions: [], doneWhen: "" } }; renderOverlay(); },
     close: () => { if (msgUnsub) { msgUnsub(); msgUnsub = null; } S.sheet = null; renderOverlay(); },
     openChat: () => openChat(id),
+    clearStats: () => run(() => clearStats()),
     saveDeadline: () => run(async () => {
       const el = document.getElementById("deadline");
       if (!el.value) return toast("Pick a date and time.");

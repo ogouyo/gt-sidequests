@@ -93,10 +93,9 @@ export function computeScores(quests, players, config, dares = []) {
     if (q.suggestedBy && !q.members.includes(q.suggestedBy) && players.has(q.suggestedBy))
       score.set(q.suggestedBy, (score.get(q.suggestedBy) || 0) + pts.suggestBonus);
   }
-  for (const d of dares) {
-    if (d.status !== "done") continue;
-    if (players.has(d.to)) score.set(d.to, (score.get(d.to) || 0) + pts.dare);
-    if (players.has(d.from)) score.set(d.from, (score.get(d.from) || 0) + pts.suggestBonus);
+  for (const d of countedDares(dares)) {
+    if (d.counts && players.has(d.to)) score.set(d.to, (score.get(d.to) || 0) + pts.dare);
+    if (d.senderCounts && players.has(d.from)) score.set(d.from, (score.get(d.from) || 0) + pts.suggestBonus);
   }
   return score;
 }
@@ -145,3 +144,20 @@ export function filterSort(list, view, uid = null) {
   else out.sort(byOrder);
   return out;
 }
+
+// Only a player's first DARE_CAP completed dares earn points (and senders earn at most DARE_CAP bonuses).
+export const DARE_CAP = 3;
+const tms = (t) => (t?.toMillis ? t.toMillis() : (t?.seconds || 0) * 1000);
+export function countedDares(dares) {
+  const done = dares.filter((d) => d.status === "done").sort((a, b) => tms(a.completedAt) - tms(b.completedAt));
+  const got = new Map(), gave = new Map();
+  return done.map((d) => {
+    const counts = (got.get(d.to) || 0) < DARE_CAP;
+    if (counts) got.set(d.to, (got.get(d.to) || 0) + 1);
+    const senderCounts = counts && (gave.get(d.from) || 0) < DARE_CAP;
+    if (senderCounts) gave.set(d.from, (gave.get(d.from) || 0) + 1);
+    return { ...d, counts, senderCounts };
+  });
+}
+// A twist with a fill-me-in placeholder means the host still has setup to do.
+export const needsSetup = (twists) => (twists || []).some((t) => /\[(HOST|Shalom|Ogouyo)/i.test(t));
